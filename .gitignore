@@ -1,0 +1,9 @@
+# Build output (rebuild with ./build.sh)
+.build/
+build/
+*.dmg
+# macOS
+.DS_Store
+# Xcode / SwiftPM
+.swiftpm/
+*.xcodeproj/xcuserdata/
