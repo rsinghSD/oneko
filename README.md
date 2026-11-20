@@ -122,6 +122,12 @@ Settings, the cat's position and the toys' positions are saved between launches.
 | `Sources/Oneko/Sounds.swift` | Synthesised purr, meow, mrrp and thud; lifetime stats |
 | `Sources/Oneko/CoatPainter.swift` | The Paint Your Coat window |
 
+## License
+
+Oneko's code is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE.md). You're welcome to use, study, modify and share it for **noncommercial** purposes, as long as the copyright notice stays. Selling it, or using it commercially, isn't allowed without permission.
+
+The classic Neko/oneko sprite artwork and the oneko.js behaviour it's based on keep their own credits and MIT notice (`Resources/oneko.js-LICENSE.txt`).
+
 ## Credits
 
 Developed with ♥ by Ramandeep Singh ([github.com/rsinghSD](https://github.com/rsinghSD)).
