@@ -7,7 +7,7 @@ cask "oneko" do
   desc "Desktop cat that chases your cursor, with physics, toys and Touch Bar support"
   homepage "https://github.com/rsinghSD/oneko"
 
-  depends_on macos: ">= :ventura"
+  depends_on macos: :ventura
 
   app "Oneko.app"
 
