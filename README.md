@@ -1,6 +1,6 @@
 # Oneko for macOS
 
-![Oneko demo: the cat chases the cursor, gets petted and yeeted, juggled and bonked with windows, naps in a box, plays with yarn, and lives on the Touch Bar](docs/8mb.video-wi7-2DdRmmdF.mp4)
+![Oneko demo: the cat chases the cursor, gets petted and yeeted, juggled and bonked with windows, naps in a box, plays with yarn, and lives on the Touch Bar](docs/oneko_trailer.gif)
 
 ▶️ [Watch the demo with sound](docs/8mb.video-wi7-2DdRmmdF.mp4)
 
