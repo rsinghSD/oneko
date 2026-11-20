@@ -2,15 +2,28 @@
 
 The classic Neko desktop cat, as a native menu bar app. It chases your cursor across every display and Space. When it's left alone it scratches, yawns and falls asleep.
 
-## Build & run
+## Install
+
+**Download:** grab `Oneko-<version>.dmg` from the [latest release](https://github.com/rsinghSD/oneko/releases/latest), open it, and drag **Oneko** to **Applications**.
+
+**Homebrew:**
 
 ```bash
-./build.sh --run
+brew tap rsinghSD/oneko https://github.com/rsinghSD/oneko
+brew install --cask oneko
 ```
 
-This builds `build/Oneko.app` (a Swift package, macOS 13+, no Xcode project needed) and launches it. `./build.sh --install` copies it to `/Applications` first. Do that before turning on Launch at Login, so the login item points at a stable location.
+Oneko runs on macOS 13 or later, on Apple silicon and Intel. It isn't notarized by Apple yet, so the first time, right-click **Oneko** in Applications and choose **Open**. Or run `xattr -dr com.apple.quarantine /Applications/Oneko.app`.
 
-`build/Oneko.app/Contents/MacOS/Oneko --selftest` runs headless checks of the cat's behaviour.
+## Build from source
+
+```bash
+./build.sh --run       # build and launch
+./build.sh --install   # build, copy to /Applications, launch
+./build.sh --dmg       # universal build + build/Oneko-<version>.dmg + Casks/oneko.rb
+```
+
+It's a Swift package; no Xcode project is needed. `build/Oneko.app/Contents/MacOS/Oneko --selftest` runs the headless self-tests. To see why physics is running, launch it with `ONEKO_DEBUG=1`.
 
 ## Playing with the cat
 
@@ -72,7 +85,12 @@ In Toolbox mode **Neko is ruled by gravity**. It can't float to your cursor any 
 - **Toolbox drawings:** shape layers composited by the GPU, with no full-screen bitmaps. That saves roughly 80 MB per display compared with drawing into a bitmap.
 - **GPU / WindowServer:** an on/off A/B test couldn't separate Oneko from normal desktop noise.
 
-## Menu
+## Menu & Settings
+
+The menu bar keeps the quick things: **Pause**, **Toys**, **Toolbox**, **Neko Lives On** (on Touch Bar Macs), **Settings…** (⌘,), **About** and **Quit**. Everything else is in **Settings**, with tabs for General, Behavior, Toys, Sounds, Touch Bar and Stats.
+
+What each option does:
+
 
 - **Pause / Resume** (⌘P): the cat curls up and sleeps where it is.
 - **Speed**: Slow, Normal, Fast or Zoomies (48 pt per tick).

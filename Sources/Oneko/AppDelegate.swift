@@ -140,7 +140,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         physicsTimer = t
     }
 
+    private static let debug = ProcessInfo.processInfo.environment["ONEKO_DEBUG"] != nil
+
     private func physicsStep() {
+        if Self.debug, physicsFrame % 60 == 0 {
+            let line = "physics: [\(play.physicsReason)] \(juggling ? "juggling" : "") \(extras.map { $0.play.physicsReason })\n"
+            FileHandle.standardError.write(line.data(using: .utf8)!)
+        }
         if let tb = touchBar {
             tb.physics(dt: 1.0 / 60)
             if !tb.needsPhysics {

@@ -240,6 +240,22 @@ struct Playground {
         return bone.state == .flying || box.state == .flying || yarn.state == .flying
     }
 
+    /// Why physics is running (for ONEKO_DEBUG).
+    var physicsReason: String {
+        var r: [String] = []
+        switch mode {
+        case .held, .flying, .landing: r.append("cat \(mode)")
+        case .walking where !walkArrived: r.append("walking")
+        default: break
+        }
+        for (n, p) in [("bone", bone), ("box", box), ("yarn", yarn)] {
+            if p.state == .flying || p.state == .held { r.append("\(n) \(p.state)") }
+            if p.isResting && abs(p.body.angle - p.settledAngle) > 0.001 { r.append("\(n) angle \(p.body.angle) vs \(p.settledAngle)") }
+        }
+        if squash != 1 { r.append("squash \(squash)") }
+        return r.joined(separator: ", ")
+    }
+
     /// True while anything needs the 60 fps physics clock.
     var needsPhysics: Bool {
         switch mode {

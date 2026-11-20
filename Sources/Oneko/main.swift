@@ -148,6 +148,57 @@ if let i = CommandLine.arguments.firstIndex(of: "--export-settings"), i + 1 < Co
     exit(0)
 }
 
+// Dev helper: `Oneko --export-iconset Dir.iconset` draws the app icon at every size:
+// Neko peeking out of its box on a night-sky rounded square, pixel-sharp.
+if let i = CommandLine.arguments.firstIndex(of: "--export-iconset"), i + 1 < CommandLine.arguments.count {
+    let dir = CommandLine.arguments[i + 1]
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    func icon(_ px: Int) -> CGImage? {
+        let s = CGFloat(px)
+        guard let ctx = CGContext(data: nil, width: px, height: px, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        // macOS icon grid: the rounded square fills ~80% with room for its shadow.
+        let body = CGRect(x: s * 0.098, y: s * 0.088, width: s * 0.804, height: s * 0.804)
+        let path = CGPath(roundedRect: body, cornerWidth: body.width * 0.225, cornerHeight: body.width * 0.225, transform: nil)
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: -s * 0.012), blur: s * 0.03,
+                      color: CGColor(gray: 0, alpha: 0.35))
+        ctx.addPath(path); ctx.setFillColor(CGColor(red: 0.3, green: 0.25, blue: 0.7, alpha: 1)); ctx.fillPath()
+        ctx.restoreGState()
+        ctx.saveGState()
+        ctx.addPath(path); ctx.clip()
+        let grad = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: [
+            CGColor(red: 0.47, green: 0.55, blue: 1.0, alpha: 1), CGColor(red: 0.27, green: 0.21, blue: 0.62, alpha: 1),
+        ] as CFArray, locations: [0, 1])!
+        ctx.drawLinearGradient(grad, start: CGPoint(x: 0, y: body.maxY), end: CGPoint(x: 0, y: body.minY), options: [])
+        // A few pixel stars.
+        ctx.setFillColor(CGColor(gray: 1, alpha: 0.85))
+        let star = max(1, (s * 0.018).rounded())
+        for (fx, fy) in [(0.24, 0.78), (0.70, 0.83), (0.82, 0.66), (0.34, 0.64), (0.58, 0.72)] {
+            ctx.fill(CGRect(x: (body.minX + body.width * fx).rounded(), y: (body.minY + body.height * fy).rounded(), width: star, height: star))
+        }
+        // The cat in its box: 32×32 pixel art, scaled up crisply.
+        ctx.interpolationQuality = .none
+        let art = (body.width * 0.78 / 32).rounded(.down) >= 1 ? (body.width * 0.78 / 32).rounded(.down) * 32 : body.width * 0.78
+        let r = CGRect(x: (s - art) / 2, y: body.minY + body.height * 0.06, width: art, height: art)
+        ctx.draw(PixelArt.boxBack.image, in: r)
+        if let cat = sprites.image(for: .idle, frame: 0) {
+            ctx.draw(cat, in: r.offsetBy(dx: -art * 2 / 32, dy: art * 7 / 32))   // tail tucked inside the box
+        }
+        ctx.draw(PixelArt.boxFront.image, in: r)
+        ctx.restoreGState()
+        return ctx.makeImage()
+    }
+    for (name, px) in [("16x16", 16), ("16x16@2x", 32), ("32x32", 32), ("32x32@2x", 64), ("128x128", 128),
+                       ("128x128@2x", 256), ("256x256", 256), ("256x256@2x", 512), ("512x512", 512), ("512x512@2x", 1024)] {
+        if let img = icon(px), let png = NSBitmapImageRep(cgImage: img).representation(using: .png, properties: [:]) {
+            try? png.write(to: URL(fileURLWithPath: "\(dir)/icon_\(name).png"))
+        }
+    }
+    exit(0)
+}
+
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)   // menu bar only, no Dock icon
 let delegate = AppDelegate(sprites: sprites)
