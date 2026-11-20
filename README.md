@@ -1,8 +1,8 @@
 # Oneko for macOS
 
-![Oneko demo: the cat chases the cursor, gets petted and yeeted, juggled and bonked with windows, naps in a box, plays with yarn, and lives on the Touch Bar](docs/demo.gif)
+![Oneko demo: the cat chases the cursor, gets petted and yeeted, juggled and bonked with windows, naps in a box, plays with yarn, and lives on the Touch Bar](docs/8mb.video-wi7-2DdRmmdF.mp4)
 
-▶️ [Watch the demo with sound](docs/demo.mp4)
+▶️ [Watch the demo with sound](docs/8mb.video-wi7-2DdRmmdF.mp4)
 
 The classic Neko desktop cat, as a native menu bar app. It chases your cursor across every display and Space. When it's left alone it scratches, yawns and falls asleep.
 
