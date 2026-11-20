@@ -26,16 +26,25 @@ final class SoundBox {
         s.play()
     }
 
+    /// The raw samples of a sound (44.1 kHz mono), e.g. to mix into a video's audio track.
+    static func samples(_ kind: Kind) -> [Float] {
+        switch kind {
+        case .purr: return purr()
+        case .meow: return meow()
+        case .mrrp: return mrrp()
+        case .thud: return thud()
+        case .sleep: return sleep()
+        }
+    }
+
+    static let sampleRate: Float = 44_100
+
+    /// 16-bit mono WAV data.
+    static func wavData(_ samples: [Float]) -> Data { wav(samples) }
+
     private func sound(_ kind: Kind) -> NSSound {
         if let s = sounds[kind] { return s }
-        let samples: [Float]
-        switch kind {
-        case .purr: samples = Self.purr()
-        case .meow: samples = Self.meow()
-        case .mrrp: samples = Self.mrrp()
-        case .thud: samples = Self.thud()
-        case .sleep: samples = Self.sleep()
-        }
+        let samples = Self.samples(kind)
         let s = NSSound(data: Self.wav(samples)) ?? NSSound()
         sounds[kind] = s
         return s

@@ -1,5 +1,9 @@
 # Oneko for macOS
 
+![Oneko demo: the cat chases the cursor, gets petted and yeeted, juggled and bonked with windows, naps in a box, plays with yarn, and lives on the Touch Bar](docs/demo.gif)
+
+▶️ [Watch the demo with sound](docs/demo.mp4)
+
 The classic Neko desktop cat, as a native menu bar app. It chases your cursor across every display and Space. When it's left alone it scratches, yawns and falls asleep.
 
 ## Install
@@ -23,7 +27,7 @@ Oneko runs on macOS 13 or later, on Apple silicon and Intel. It isn't notarized 
 ./build.sh --dmg       # universal build + build/Oneko-<version>.dmg + Casks/oneko.rb
 ```
 
-It's a Swift package; no Xcode project is needed. `build/Oneko.app/Contents/MacOS/Oneko --selftest` runs the headless self-tests. To see why physics is running, launch it with `ONEKO_DEBUG=1`.
+It's a Swift package; no Xcode project is needed. `./make-demo.sh` re-renders the demo video from the real engine (needs ffmpeg). `build/Oneko.app/Contents/MacOS/Oneko --selftest` runs the headless self-tests. To see why physics is running, launch it with `ONEKO_DEBUG=1`.
 
 ## Playing with the cat
 

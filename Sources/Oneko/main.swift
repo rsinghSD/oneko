@@ -199,6 +199,14 @@ if let i = CommandLine.arguments.firstIndex(of: "--export-iconset"), i + 1 < Com
     exit(0)
 }
 
+// Dev helper: `Oneko --render-demo <dir>` renders the README demo video frames + audio.
+if let i = CommandLine.arguments.firstIndex(of: "--render-demo"), i + 1 < CommandLine.arguments.count {
+    _ = NSApplication.shared
+    NSApp.appearance = NSAppearance(named: .aqua)
+    DemoRenderer(sprites: sprites, dir: CommandLine.arguments[i + 1])?.render()
+    exit(0)
+}
+
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)   // menu bar only, no Dock icon
 let delegate = AppDelegate(sprites: sprites)
