@@ -6,11 +6,22 @@ final class MouseView: NSView {
     var onDrag: ((CGPoint, TimeInterval) -> Void)?
     var onUp: ((CGPoint, TimeInterval, Int) -> Void)?
     var onRightClick: (() -> Void)?
+    /// ⌥-click (instead of a grab): rename the cat.
+    var onOptionClick: (() -> Void)?
+    /// This press was an ⌥-click: its drag and release aren't a grab either.
+    private var optionPress = false
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    override func mouseDown(with e: NSEvent) { onDown?(NSEvent.mouseLocation, e.timestamp) }
-    override func mouseDragged(with e: NSEvent) { onDrag?(NSEvent.mouseLocation, e.timestamp) }
-    override func mouseUp(with e: NSEvent) { onUp?(NSEvent.mouseLocation, e.timestamp, e.clickCount) }
+    override func mouseDown(with e: NSEvent) {
+        optionPress = e.modifierFlags.contains(.option) && onOptionClick != nil
+        if optionPress { onOptionClick?(); return }
+        onDown?(NSEvent.mouseLocation, e.timestamp)
+    }
+    override func mouseDragged(with e: NSEvent) { if !optionPress { onDrag?(NSEvent.mouseLocation, e.timestamp) } }
+    override func mouseUp(with e: NSEvent) {
+        if optionPress { optionPress = false; return }
+        onUp?(NSEvent.mouseLocation, e.timestamp, e.clickCount)
+    }
     override func rightMouseDown(with e: NSEvent) { onRightClick?() }
 }
 
@@ -44,13 +55,57 @@ class OverlayPanel: NSPanel {
     func setSide(_ s: CGFloat) {
         side = s
         setContentSize(NSSize(width: s, height: s))
+        artShift = .zero   // the subclass re-centres its art; the next `place` shifts it again
     }
 
-    /// Centre the panel on `center` (global, y-up).
+    /// The layer with the art (a cat's or a toy's rig), centred in the panel. When it's set,
+    /// `place` keeps the panel on one display and moves this layer instead.
+    var artLayer: CALayer?
+    private var artShift = CGPoint.zero
+
+    /// Centre the art on `center` (global, y-up).
+    ///
+    /// The panel is twice the art's size (room to spin), so near the edge of a display it
+    /// hangs over onto the next one. With a separate Space per display (macOS's default),
+    /// a window only shows on one display, and macOS may pick the other one: the cat got
+    /// clipped, vanished or jumped at the corner between two monitors. So the panel slides
+    /// back inside the display under the art's centre, and the art moves the other way
+    /// within it, staying exactly where it was.
     func place(_ center: CGPoint) {
-        let o = NSPoint(x: (center.x - side / 2).rounded(), y: (center.y - side / 2).rounded())
+        var o = NSPoint(x: (center.x - side / 2).rounded(), y: (center.y - side / 2).rounded())
+        if let art = artLayer, Self.separateSpaces {
+            let (origin, shift) = Self.fit(origin: o, side: side, center: center, displays: Self.displays)
+            o = origin
+            if shift != artShift {
+                artShift = shift
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                art.position = CGPoint(x: side / 2 + shift.x, y: side / 2 + shift.y)
+                CATransaction.commit()
+            }
+        }
         if frame.origin != o { setFrameOrigin(o) }
     }
+
+    /// The panel origin inside the display that holds `center`, and how far the art has to
+    /// move within the panel to stay put. Unchanged when no display holds it, or the panel
+    /// doesn't fit.
+    static func fit(origin o: CGPoint, side: CGFloat, center: CGPoint, displays: [CGRect]) -> (CGPoint, CGPoint) {
+        guard let d = displays.first(where: { $0.contains(center) }), d.width >= side, d.height >= side
+        else { return (o, .zero) }
+        let x = min(max(o.x, d.minX), d.maxX - side), y = min(max(o.y, d.minY), d.maxY - side)
+        return (CGPoint(x: x, y: y), CGPoint(x: o.x - x, y: o.y - y))
+    }
+
+    static let separateSpaces = NSScreen.screensHaveSeparateSpaces
+    /// Display frames, kept current (read for every panel move, so not asked of AppKit each time).
+    private static var displays: [CGRect] = {
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                                               object: nil, queue: .main) { _ in
+            OverlayPanel.displays = NSScreen.screens.map(\.frame)
+        }
+        return NSScreen.screens.map(\.frame)
+    }()
 
     static func pixelLayer() -> CALayer {
         let l = CALayer()
@@ -147,6 +202,7 @@ final class CatRig {
         sprite.contents = image
         let lift = -(spriteSize / 2) * (1 - pose.squash)   // squash from the feet
         sprite.position = CGPoint(x: side / 2, y: side / 2 + (pose.inBox ? 4 * scale : 0))   // peek out of the box
+        // (In a big box the box's own windows go behind and in front of the cat.)
         sprite.setAffineTransform(CGAffineTransform(rotationAngle: pose.angle)
             .translatedBy(x: 0, y: lift).scaledBy(x: 1, y: pose.squash))
         let shut = pose.inBox && pose.boxClosed
@@ -219,6 +275,7 @@ final class CatWindow: OverlayPanel {
     override init() {
         super.init()
         mouseView.layer?.addSublayer(rig.layer)
+        artLayer = rig.layer
         setScale(1)
     }
 
@@ -313,6 +370,7 @@ final class PropWindow: OverlayPanel {
         rig = PropRig(art: art)
         super.init()
         mouseView.layer?.addSublayer(rig.layer)
+        artLayer = rig.layer
         setScale(1)
     }
 
@@ -325,6 +383,9 @@ final class PropWindow: OverlayPanel {
     func setClipped(_ on: Bool) { rig.setClipped(on) }
 
     func setArt(_ a: Art) {
+        // Called on every render for bowls and boxes: the same art again changes
+        // nothing, so skip the resize (a WindowServer call) and the layer write.
+        guard a.image !== rig.art.image else { return }
         rig.setArt(a)
         setSide(rig.side)
         rig.layer.position = CGPoint(x: side / 2, y: side / 2)

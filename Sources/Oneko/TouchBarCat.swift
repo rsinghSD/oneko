@@ -43,8 +43,8 @@ final class TouchBarCat: NSObject, NSTouchBarDelegate {
     /// Called when something starts moving and needs the 60 fps clock.
     var onNeedsPhysics: (() -> Void)?
     /// A clearly upward flick: the cat leaves for the desktop. Gives where along the bar it
-    /// left (0…1) and its launch velocity.
-    var onYeetToDesktop: ((CGFloat, CGVector) -> Void)?
+    /// left (0…1), its launch velocity, and which extra cat it was (nil: the first cat).
+    var onYeetToDesktop: ((CGFloat, CGVector, Int?) -> Void)?
     /// Everything that happens on the bar (for sounds and stats).
     var onEvent: ((PlaygroundEvent) -> Void)?
     /// Off: flicks never send Neko to the desktop (it just bounces around the bar).
@@ -75,7 +75,7 @@ final class TouchBarCat: NSObject, NSTouchBarDelegate {
 
     /// The most cats the bar takes (it's only about 33 cats wide; past that they pile up).
     static let maxCats = 50
-    /// Cats 2, 3, … on the bar: same playground rules, no toys of their own.
+    /// Cats 2, 3, … on the bar: same playground rules, sharing the first cat's box.
     private(set) var extras: [Playground] = []
     private var extraSheets: [SpriteSheet] = []
     private var behavior: Settings.CatBehavior = .swarm
@@ -127,14 +127,17 @@ final class TouchBarCat: NSObject, NSTouchBarDelegate {
         noCat = n == 0
         extraSheets = sheets
         let want = max(0, min(n, Self.maxCats) - 1)
-        if extras.count > want { extras.removeLast(extras.count - want) }
+        while extras.count > want { extras[extras.count - 1].leaveBoxes(); extras.removeLast() }
         while extras.count < want {
             let i = extras.count
             var p = Playground(position: CGPoint(x: play.cat.position.x + CGFloat(i % 2 == 0 ? 1 : -1) * CGFloat(14 * (i / 2 + 1)), y: 13))
             p.gravityMode = true
             p.spotWindows = false; p.spotMenuBar = false; p.spotDock = false
             p.throwLift = Self.hopLift
-            p.random = { Int.random(in: 0..<max($0, 1)) }
+            p.random = { Dice.roll($0) }
+            p.toys = play.toys            // any cat on the bar can nap in the box
+            p.catID = i + 1
+            p.ownsToys = false
             extras.append(p)
         }
         roam = extras.map { _ in span.minX + CGFloat.random(in: 0...1) * span.width }
@@ -272,14 +275,19 @@ final class TouchBarCat: NSObject, NSTouchBarDelegate {
             extras[i].physics(dt: dt, world: w)
         }
         // Got well above the top of the bar on its way up (say, flung by a box): off it goes.
-        if flickToDesktop, !leaving, Self.isEscaping(play) {
-            leaving = true
-            let (minX, w) = span
-            let along = max(0, min(1, (play.cat.position.x - minX) / w))
-            let v = play.catBody.vel
-            let up = CGVector(dx: v.dx * 0.6, dy: max(1500, v.dy * 1.4))
-            DispatchQueue.main.async { [weak self] in self?.onYeetToDesktop?(along, up) }
-            return
+        // Any cat, not just the first.
+        if flickToDesktop, !leaving {
+            let escaping: (Int?, Playground)? = Self.isEscaping(play) ? (nil, play)
+                : extras.indices.first { Self.isEscaping(extras[$0]) }.map { ($0, extras[$0]) }
+            if let (who, p) = escaping {
+                leaving = true
+                let (minX, w) = span
+                let along = max(0, min(1, (p.cat.position.x - minX) / w))
+                let v = p.catBody.vel
+                let up = CGVector(dx: v.dx * 0.6, dy: max(1500, v.dy * 1.4))
+                DispatchQueue.main.async { [weak self] in self?.onYeetToDesktop?(along, up, who) }
+                return
+            }
         }
         afterChange()
     }
@@ -308,11 +316,17 @@ final class TouchBarCat: NSObject, NSTouchBarDelegate {
         render()
     }
 
-    /// Slammed down through the bottom of the screen: drop in from above the bar.
-    func arrive(along: CGFloat) {
+    /// Slammed down through the bottom of the screen: drop in from above the bar. `cat`: which
+    /// extra cat it was on the desktop (nil: the first); the same one drops in, if the bar has it.
+    func arrive(along: CGFloat, cat: Int? = nil) {
         leaving = false
         let (minX, w) = span
-        play.launch(at: CGPoint(x: minX + max(0.05, min(0.95, along)) * w, y: 160), velocity: CGVector(dx: 0, dy: -500))
+        let at = CGPoint(x: minX + max(0.05, min(0.95, along)) * w, y: 160)
+        if let i = cat, i < extras.count {
+            extras[i].launch(at: at, velocity: CGVector(dx: 0, dy: -500))
+        } else {
+            play.launch(at: at, velocity: CGVector(dx: 0, dy: -500))
+        }
         render()
         onNeedsPhysics?()
     }
@@ -337,7 +351,8 @@ final class TouchBarCat: NSObject, NSTouchBarDelegate {
             if thing(at: p) == nil, let i = extras.lastIndex(where: { $0.catContains(p, slop: 6) }) {
                 touchExtra = i                           // one of the other cats
                 touchThing = .cat
-                extras[i].mouseDown(on: .cat, at: p, time: t)
+                let shut = extras[i].inBox && extras[i].boxClosed   // a shut-in cat comes with its box
+                extras[i].mouseDown(on: shut ? .box : .cat, at: p, time: t)
                 let work = DispatchWorkItem { [weak self] in self?.longPressFired() }
                 longPress = work
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
@@ -374,9 +389,15 @@ final class TouchBarCat: NSObject, NSTouchBarDelegate {
                 if let l = lastTap, t - l.t < 0.35, abs(l.x - p.x) < 24 { clicks = 2 }
                 lastTap = (p.x, t)
             }
-            if let i = touchExtra {                       // the other cats stay on the bar
+            if let i = touchExtra {
                 extras[i].mouseUp(at: p, time: t, clickCount: clicks)
                 touchExtra = nil
+                // Flicked up (or very hard): this cat goes to the desktop too.
+                if flickToDesktop, Self.goesToDesktop(extras[i]), !leaving {
+                    leaving = true
+                    yeet(extras[i], who: i)
+                    return
+                }
                 afterChange()
                 onNeedsPhysics?()
                 return
@@ -384,14 +405,7 @@ final class TouchBarCat: NSObject, NSTouchBarDelegate {
             play.mouseUp(at: p, time: t, clickCount: clicks)
             if flickToDesktop, touchThing == .cat, Self.goesToDesktop(play), !leaving {
                 leaving = true
-                // Flicked up (or very hard): off the Touch Bar and up onto the desktop, always
-                // upward, keeping some of the sideways direction, 1.4× as fast as the flick.
-                let (minX, w) = span
-                let along = max(0, min(1, (play.cat.position.x - minX) / w))
-                let speed = Self.flickSpeed(play) * 1.4
-                let raw = play.catBody.vel.dx / Playground.throwBoost
-                let v = CGVector(dx: raw * 0.6, dy: max(1500, speed))
-                DispatchQueue.main.async { [weak self] in self?.onYeetToDesktop?(along, v) }
+                yeet(play, who: nil)
                 return
             }
             afterChange()
@@ -399,6 +413,17 @@ final class TouchBarCat: NSObject, NSTouchBarDelegate {
         default:
             break
         }
+    }
+
+    /// Flicked up (or very hard): off the Touch Bar and up onto the desktop, always upward,
+    /// keeping some of the sideways direction, 1.4× as fast as the flick.
+    private func yeet(_ p: Playground, who: Int?) {
+        let (minX, w) = span
+        let along = max(0, min(1, (p.cat.position.x - minX) / w))
+        let speed = Self.flickSpeed(p) * 1.4
+        let raw = p.catBody.vel.dx / Playground.throwBoost
+        let v = CGVector(dx: raw * 0.6, dy: max(1500, speed))
+        DispatchQueue.main.async { [weak self] in self?.onYeetToDesktop?(along, v, who) }
     }
 
     private func longPressFired() {
@@ -414,7 +439,7 @@ final class TouchBarCat: NSObject, NSTouchBarDelegate {
             return play.inBox && play.boxClosed ? .box : .cat   // a shut-in cat comes with its box
         }
         if play.bone.isOut, abs(p.x - play.bone.body.pos.x) < 14, abs(p.y - play.bone.body.pos.y) < 22 { return .bone }
-        if play.box.isOut, !play.inBox, abs(p.x - play.box.body.pos.x) < 18 { return .box }
+        if play.box.isOut, play.toys.boxes.first?.napper == nil, abs(p.x - play.box.body.pos.x) < 18 { return .box }
         return nil
     }
 }
@@ -470,7 +495,7 @@ final class TouchBarCatView: NSView {
             bone.setClipped(play.bone.state == .pinned)
             bone.layer.position = play.bone.body.pos
         }
-        let showBox = play.box.isOut && !pose.inBox
+        let showBox = play.box.isOut && play.toys.boxes.first?.napper == nil   // a cat in it draws it
         box.layer.isHidden = !showBox
         if showBox {
             box.setArt(play.boxClosed ? PixelArt.boxClosed : PixelArt.box)

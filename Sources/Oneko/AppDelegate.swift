@@ -8,14 +8,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let settings = Settings()
     private(set) var play = Playground(position: .zero)
     private let catWindow = CatWindow()
-    private let boneWindow = PropWindow(art: PixelArt.bone)
-    private let boxWindow = PropWindow(art: PixelArt.box)
-    private let yarnWindow = PropWindow(art: PixelArt.yarn)
+    /// One window per bone and per ball of yarn (up to 50 each).
+    private var boneWindows: [PropWindow] = []
+    private var yarnWindows: [PropWindow] = []
+    private var bowlWindows: [PropWindow] = []
+    /// The front of a big box (box 0), drawn in front of the cats in it.
+    private var bigFront: PropWindow?
+    /// Pairs of cats playing together (nil = the first cat, else an extra cat's index).
+    private var playPairs: [(Int?, Int?)] = []
+    /// Every cardboard box, shared by all the cats.
+    private let toys = ToyPile()
+    /// One window per real box (up to 50).
+    private var boxWindows: [PropWindow] = []
+    /// Boxes past 50: a GPU-drawn heap.
+    private var heap: BoxHeap?
     private let laserWindow = OverlayPanel()
     private let laserDot = OverlayPanel.pixelLayer()
     private(set) var laserOn = false
     let sounds = SoundBox()
     let stats = Stats()
+    let catStats = CatStats()
+    private(set) lazy var updates = UpdateChecker(settings: settings)
+    /// Rain, thunder, sun or snow (your real weather), snow or leaves (by the season), or as you chose.
+    private var season: SeasonOverlay?
     /// Extra cats (beyond the first, up to 50 in all), fully interactive.
     private var extras: [ExtraCat] = []
     /// Crowd mode: every cat past 50, drawn by the GPU.
@@ -47,6 +62,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         super.init()
         self.sprites = sheetForCurrentSkin()
         world = WorldReader.read()
+        play.toys = toys
         play.cat.position = startPosition()
     }
 
@@ -72,14 +88,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if settings.touchBarCat && TouchBarCat.isSupported { setHome(touchBar: true) }
 
         setLogicRate(deepSleep ? 1.0 : 0.1)
+        let version = WhatsNewWindow.currentVersion
         if !settings.seenWelcome {
             settings.seenWelcome = true
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in self?.showWelcome() }
+        } else if settings.shouldShowWhatsNew(current: version) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in self?.showWhatsNew() }
         }
+        settings.lastSeenVersion = version
+        // A while after launch, so it never slows startup down.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in self?.updates.checkIfDue() }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         savePositions()
+        catStats.save()
         touchBar?.uninstall()
     }
 
@@ -105,6 +128,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateDeepSleep()
         if tickCount % 10 == 0 { updateReactions() }
         play.laser = laserOn
+        updatePlay()
         play.tick10(world: world)
         handleEvents()
         tickExtras()
@@ -113,7 +137,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if asleep && !wasAsleep && !deepSleep { sounds.play(.sleep) }
         wasAsleep = asleep
         toolbox?.tick(now: CACurrentMediaTime())
-        if tickCount % 50 == 0 { savePositions() }
+        heap?.setCovered(settings.hideInFullScreen ? world.fullScreenDisplays : [])
+        if tickCount % 50 == 0 { savePositions(); catStats.save() }
+        if tickCount % 10 == 0 { updateSeason() }
         if tickCount % 10 == 0, settingsWindow?.isVisible == true { settingsWindow?.refresh() }
         startPhysicsIfNeeded()
         render()
@@ -133,15 +159,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         world = WorldReader.read()
         world.drawings = toolbox?.drawings ?? []
         let now = CACurrentMediaTime()
-        play.updateWindows(world, dt: CGFloat(min(0.25, now - lastWindowRead)))
-        for e in extras { e.play.updateWindows(world, dt: CGFloat(min(0.25, now - lastWindowRead))) }
+        let dt = CGFloat(min(0.25, now - lastWindowRead))
+        play.updateWindows(world, dt: dt)
+        for e in extras { e.play.updateWindows(world, dt: dt) }
         lastWindowRead = now
     }
 
     /// 60 Hz, only while something is being thrown, carried, falling or juggled.
     private func startPhysicsIfNeeded() {
         let needed = touchBar.map { $0.needsPhysics }
-            ?? (play.needsPhysics || juggling || extras.contains { $0.play.needsPhysics })
+            ?? (play.needsPhysics || juggling || extras.contains { $0.needsPhysics })
         guard physicsTimer == nil, needed else { return }
         let t = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.physicsStep() }
         t.tolerance = 0.002
@@ -150,6 +177,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private static let debug = ProcessInfo.processInfo.environment["ONEKO_DEBUG"] != nil
+
+    /// ONEKO_DEBUG: what the window work costs (WindowServer calls included, which the
+    /// headless bench can't see), printed every 10 s.
+    private struct WindowTiming {
+        var render = 0.0, visibility = 0.0, clickThrough = 0.0
+        var renders = 0, clicks = 0, restacks = 0, restacked = 0
+        var since = CACurrentMediaTime()
+    }
+    private var timing = WindowTiming()
+
+    private func reportTiming() {
+        let now = CACurrentMediaTime(), t = timing, span = now - t.since
+        guard span >= 10 else { return }
+        let line = String(format: "windows, last %.0f s: render %.3f ms × %d (visibility %.3f ms of it), "
+                          + "click-through %.3f ms × %d, %d restacks (%d windows), %.1f %% of a core\n",
+                          span, t.render * 1000 / Double(max(1, t.renders)), t.renders,
+                          t.visibility * 1000 / Double(max(1, t.renders)), t.clickThrough * 1000 / Double(max(1, t.clicks)),
+                          t.clicks, t.restacks, t.restacked, (t.render + t.clickThrough) / span * 100)
+        FileHandle.standardError.write(line.data(using: .utf8)!)
+        timing = WindowTiming(since: now)
+    }
 
     private func physicsStep() {
         if Self.debug, physicsFrame % 60 == 0 {
@@ -169,28 +217,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         world.cursor = NSEvent.mouseLocation
         world.drawings = toolbox?.drawings ?? []
         play.physics(dt: 1.0 / 60, world: world)
-        for (i, e) in extras.enumerated() {
-            var w = world
-            w.cursor = target(of: i)
+        // Only the cats with something going on (thousands of idle cats cost nothing here).
+        let squash = swarmSquash
+        var w = world
+        w.pointer = world.cursor   // bones come back to you, not to their spot
+        var moved: [Int] = []
+        var anyExtra = false
+        for (i, e) in extras.enumerated() where e.needsPhysics || draggingExtra == i {
+            w.cursor = target(of: i, squash: squash)
             e.play.physics(dt: 1.0 / 60, world: w)
+            moved.append(i)
+            anyExtra = anyExtra || e.needsPhysics
         }
-        handleEvents()
-        render()
-        if !play.needsPhysics && !juggling && !extras.contains(where: { $0.play.needsPhysics }) {
+        handleEvents(extras: moved)
+        render(extras: moved)
+        if !play.needsPhysics && !juggling && !anyExtra {
             physicsTimer?.invalidate()
             physicsTimer = nil
         }
     }
 
-    private func handleEvents() {
-        for e in play.drainEvents() { react(to: e, window: catWindow, primary: true) }
-        for x in extras {
-            for e in x.play.drainEvents() { react(to: e, window: x.window, primary: false) }
+    /// `only`, or every extra cat (without building an array of every index, every tick).
+    private func eachExtra(_ only: [Int]?, _ f: (Int) -> Void) {
+        if let only { for i in only { f(i) } } else { for i in extras.indices { f(i) } }
+    }
+
+    /// `only`: just these extra cats (the rest had nothing happen this frame).
+    private func handleEvents(extras only: [Int]? = nil) {
+        for e in play.drainEvents() { react(to: e, window: catWindow, cat: nil) }
+        eachExtra(only) { i in
+            let x = extras[i]
+            for e in x.play.drainEvents() { react(to: e, window: x.window, cat: i) }
         }
     }
 
-    /// Hearts, sounds and stats for whatever just happened.
-    private func react(to e: PlaygroundEvent, window: CatWindow?, primary: Bool) {
+    /// Hearts, sounds and stats for whatever just happened. `cat`: which extra cat (nil: the
+    /// first cat, or one on the Touch Bar).
+    private func react(to e: PlaygroundEvent, window: CatWindow?, cat: Int?) {
+        let id = window == nil ? 0 : (cat.map { $0 + 1 } ?? 0)   // whose stats (the bar counts as the first cat)
+        switch e {
+        case .heart: catStats.bump(.pets, cat: id)
+        case .thrown(let speed) where speed > 600: catStats.bump(.yeets, cat: id)
+        case .boxHop: catStats.bump(.naps, cat: id)
+        case .fetched: catStats.bump(.fetches, cat: id)
+        case .ate: catStats.bump(.meals, cat: id)
+        case .played: catStats.bump(.playdates, cat: id)
+        default: break
+        }
         switch e {
         case .heart:
             window?.popHeart()
@@ -203,69 +276,130 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             stats.record(.highestYeet, max: Int(h))
         case .landed(let impact, let win, let at):
             if impact > 900 { sounds.play(.thud) }
-            if primary { maybeDropIntoTouchBar(impact: impact, onWindow: win, at: at) }
+            if window != nil { maybeDropIntoTouchBar(impact: impact, onWindow: win, at: at, cat: cat) }
         case .fetched: stats.bump(.fetches)
         case .bonked: stats.bump(.windowBonks); sounds.play(.mrrp)
         case .dockYeet: stats.bump(.dockYeets); sounds.play(.meow)
+        case .dockBonk: stats.bump(.dockYeets); sounds.play(.mrrp)
         case .boxHop: stats.bump(.boxNaps); sounds.play(.mrrp)
         case .batYarn: stats.bump(.yarnBats)
         case .woke: sounds.play(.meow)
+        case .ate: stats.bump(.meals); sounds.play(.purr)
+        case .played: stats.bump(.playdates); sounds.play(.mrrp)
         default: break
         }
     }
 
     // MARK: - Drawing
 
-    private func render() {
+    /// `only`: draw just these extra cats (60 fps frames redraw only the ones that moved; the
+    /// 10 Hz tick draws everyone).
+    private func render(extras only: [Int]? = nil) {
         guard touchBar == nil else { return }   // the desktop cat is away on the Touch Bar
+        let t0 = Self.debug ? CACurrentMediaTime() : 0
+        defer { if Self.debug { timing.render += CACurrentMediaTime() - t0; timing.renders += 1; reportTiming() } }
         let pose = play.catPose
         catWindow.render(pose, image: sprites.image(for: pose.sprite, frame: pose.frame), hatAnchor: hatAnchor(pose, sprites))
-        for x in extras {
-            let p = x.play.catPose
+        eachExtra(only) { i in
+            let x = extras[i]
+            let p = x.pose
             x.window.render(p, image: x.sprites.image(for: p.sprite, frame: p.frame), hatAnchor: hatAnchor(p, x.sprites))
         }
-        if play.yarn.isOut {
-            yarnWindow.setClipped(play.yarn.state == .pinned)
-            yarnWindow.render(play.yarn.body)
-        }
         if laserOn { laserWindow.place(NSEvent.mouseLocation) }
-        if play.bone.isOut {
-            boneWindow.setClipped(play.bone.state == .pinned)
-            boneWindow.render(play.bone.body)
+        syncToyWindows()
+        for (w, y) in zip(yarnWindows, toys.yarns) where y.prop.isOut {
+            w.setClipped(y.prop.state == .pinned)
+            w.render(y.prop.body)
         }
-        if play.box.isOut {
-            boxWindow.setArt(play.boxClosed ? PixelArt.boxClosed : PixelArt.box)
-            boxWindow.setClipped(play.box.state == .pinned)
-            boxWindow.render(play.box.body)
+        for (w, b) in zip(boneWindows, toys.bones) where b.prop.isOut {
+            w.setClipped(b.prop.state == .pinned)
+            w.render(b.prop.body)
         }
-        updateVisibility(pose)
+        for (w, b) in zip(bowlWindows, toys.bowls) where b.prop.isOut {
+            w.setArt(b.food > 0 ? PixelArt.bowlFull : PixelArt.bowlEmpty)
+            w.setClipped(b.prop.state == .pinned)
+            w.render(b.prop.body)
+        }
+        if let f = bigFront, let b = toys.boxes.first, b.prop.isOut { f.render(b.prop.body) }
+        for (w, b) in zip(boxWindows, toys.boxes) where b.prop.isOut && (b.big || !b.occupied) {
+            if !b.big { w.setArt(b.closed ? PixelArt.boxClosed : PixelArt.box) }
+            w.setClipped(b.prop.state == .pinned)
+            w.render(b.prop.body)
+        }
+        updateVisibility(pose, extras: only)
     }
 
-    private func updateVisibility(_ pose: CatPose) {
+    /// A window that was just clicked: the click may have brought it to the front of its level,
+    /// so the next `updateVisibility` puts it back in its place (it only moves windows that
+    /// are appearing, and this one already shows).
+    private var reseat: NSWindow?
+
+    private func updateVisibility(_ pose: CatPose, extras only: [Int]? = nil) {
+        let t0 = Self.debug ? CACurrentMediaTime() : 0
+        defer { if Self.debug { timing.visibility += CACurrentMediaTime() - t0 } }
         let covered = settings.hideInFullScreen ? world.fullScreenDisplays : []
         func hiddenAt(_ p: CGPoint) -> Bool { covered.contains { $0.contains(p) } }
 
-        let wantBox = play.box.isOut && !pose.inBox && !hiddenAt(play.box.body.pos)
-        let wantBone = play.bone.isOut && !hiddenAt(play.bone.body.pos)
-        let wantYarn = play.yarn.isOut && !hiddenAt(play.yarn.body.pos)
         let wantCat = !noCat && (!hiddenAt(pose.center) || dragging == .cat)
-        var order: [(NSWindow, Bool)] = [(boxWindow, wantBox), (boneWindow, wantBone), (yarnWindow, wantYarn)]
-        for (i, x) in extras.enumerated() { order.append((x.window, !hiddenAt(x.play.cat.position) || draggingExtra == i)) }
+        // A box with a cat in it is drawn by that cat's window.
+        var order: [(NSWindow, Bool)] = zip(boxWindows, toys.boxes).map { w, b in
+            (w, b.prop.isOut && (b.big || !b.occupied) && !hiddenAt(b.prop.body.pos))
+        }
+        order += zip(boneWindows, toys.bones).map { ($0, $1.prop.isOut && !hiddenAt($1.prop.body.pos)) }
+        order += zip(yarnWindows, toys.yarns).map { ($0, $1.prop.isOut && !hiddenAt($1.prop.body.pos)) }
+        order += zip(bowlWindows, toys.bowls).map { ($0, $1.prop.isOut && !hiddenAt($1.prop.body.pos)) }
+        let toyCount = order.count
+        eachExtra(only) { i in
+            let x = extras[i]
+            order.append((x.window, !hiddenAt(x.play.cat.position) || draggingExtra == i))
+        }
         order.append((catWindow, wantCat))
+        if let f = bigFront, let b = toys.boxes.first {   // in front of the cats sitting in it
+            order.append((f, b.prop.isOut && !hiddenAt(b.prop.body.pos)))
+        }
         order.append((laserWindow, laserOn))
-        var restack = false
+        let again = reseat
+        reseat = nil
+        func place(_ w: NSWindow, _ want: Bool) -> Bool { want && (!w.isVisible || w === again) }
+        var appearing = false
         for (w, want) in order {
-            if want && !w.isVisible { restack = true } else if !want && w.isVisible { w.orderOut(nil) }
+            if place(w, want) { appearing = true } else if !want && w.isVisible { w.orderOut(nil) }
         }
-        if restack {   // toys at the back, then the extra cats, the first cat, the laser dot
-            for (w, want) in order where want { w.orderFrontRegardless() }
+        guard appearing else { return }
+        // Back to front: toys, the extra cats, the first cat, the big box's front, the laser dot.
+        // Only the windows that are appearing move, each to just under its nearest visible
+        // neighbour above it in that order (one WindowServer call each, not one per window).
+        // On a frame that only looked at some extra cats, the others still count as neighbours,
+        // so a toy that pops out goes under every cat, not just the ones that moved.
+        if let only {
+            let tail = order[(toyCount + only.count)...]
+            var full = Array(order[..<toyCount])
+            full.reserveCapacity(toyCount + extras.count + tail.count)
+            for x in extras { full.append((x.window, false)) }
+            for (k, i) in only.enumerated() { full[toyCount + i].1 = order[toyCount + k].1 }
+            full += tail
+            order = full
         }
+        var above: NSWindow?, placed = 0
+        for (w, want) in order.reversed() {
+            if place(w, want) {
+                // A neighbour on another level (the laser dot) doesn't stack with this one.
+                if let a = above, a.level == w.level {
+                    w.order(.below, relativeTo: a.windowNumber)
+                } else {
+                    w.orderFrontRegardless()
+                }
+                placed += 1
+            }
+            if w.isVisible { above = w }
+        }
+        if Self.debug { timing.restacks += 1; timing.restacked += placed }
     }
 
     // MARK: - Mouse
 
     private func wireMouse() {
-        let pairs: [(OverlayPanel, Thing)] = [(catWindow, .cat), (boneWindow, .bone), (boxWindow, .box), (yarnWindow, .yarn)]
+        let pairs: [(OverlayPanel, Thing)] = [(catWindow, .cat)]
         for (window, thing) in pairs {
             window.mouseView.onDown = { [weak self] p, t in
                 guard let self else { return }
@@ -274,6 +408,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 dragging = target
                 play.mouseDown(on: target, at: p, time: t)
             }
+            window.mouseView.onOptionClick = { [weak self] in self?.renameCat(0) }
             window.mouseView.onRightClick = { [weak self] in
                 guard let self else { return }
                 play.rightClick(thing)
@@ -294,11 +429,96 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 dragging = nil
                 handleEvents()
                 startPhysicsIfNeeded()
+                reseat = window
                 render()
                 updateClickThrough()
             }
         }
         if !deepSleep { installMouseMonitors() }
+    }
+
+    /// One window per real box, bone and ball of yarn, made (and wired up) as they're added.
+    private func syncToyWindows() {
+        sync(&boxWindows, count: toys.boxes.count, art: PixelArt.box, thing: .box)
+        sync(&boneWindows, count: toys.bones.count, art: PixelArt.bone, thing: .bone)
+        sync(&yarnWindows, count: toys.yarns.count, art: PixelArt.yarn, thing: .yarn)
+        sync(&bowlWindows, count: toys.bowls.count, art: PixelArt.bowlFull, thing: .bowl)
+        syncBigBox()
+    }
+
+    /// A big box is two windows at twice the size: its back behind the cats in it, its front
+    /// in front of them.
+    private func syncBigBox() {
+        let big = toys.boxes.first?.big ?? false
+        let k = settings.size.rawValue * 2
+        if big, let back = boxWindows.first {
+            if back.art.image !== PixelArt.boxBack.image || back.rig.scale != CGFloat(k) {
+                back.setArt(PixelArt.boxBack)
+                back.setScale(k)
+            }
+            if bigFront == nil {
+                let f = PropWindow(art: PixelArt.boxFront)
+                f.setScale(k)
+                wire(f, thing: .box, index: 0)
+                bigFront = f
+            } else if bigFront!.rig.scale != CGFloat(k) {
+                bigFront!.setScale(k)
+            }
+        } else if let f = bigFront {
+            f.orderOut(nil)
+            bigFront = nil
+            boxWindows.first?.setArt(PixelArt.box)
+            boxWindows.first?.setScale(settings.size.rawValue)
+        }
+    }
+
+    /// Mouse handling for a toy window: drag and throw it, click it, right-click it.
+    private func wire(_ w: PropWindow, thing: Thing, index i: Int) {
+        w.mouseView.onDown = { [weak self] p, t in
+            guard let self else { return }
+            dragging = thing
+            play.mouseDown(on: thing, at: p, time: t, index: i)
+        }
+        w.mouseView.onRightClick = { [weak self] in
+            guard let self else { return }
+            play.rightClick(thing, index: i)
+            if !play.isDragging { dragging = nil }
+            startPhysicsIfNeeded()
+            render()
+            updateClickThrough()
+        }
+        w.mouseView.onDrag = { [weak self] p, t in
+            guard let self else { return }
+            play.mouseDragged(to: p, time: t)
+            startPhysicsIfNeeded()
+            render()
+        }
+        w.mouseView.onUp = { [weak self] p, t, clicks in
+            guard let self else { return }
+            play.mouseUp(at: p, time: t, clickCount: clicks)
+            dragging = nil
+            handleEvents()
+            startPhysicsIfNeeded()
+            reseat = w
+            render()
+            updateClickThrough()
+        }
+    }
+
+    private func sync(_ windows: inout [PropWindow], count: Int, art: Art, thing: Thing) {
+        while windows.count > count { windows.removeLast().orderOut(nil) }
+        while windows.count < count {
+            let i = windows.count
+            let w = PropWindow(art: art)
+            w.setScale(settings.size.rawValue)
+            wire(w, thing: thing, index: i)
+            windows.append(w)
+        }
+    }
+
+    /// Every toy window, back to front.
+    private var toyWindows: [PropWindow] {
+        boxWindows + boneWindows + yarnWindows + bowlWindows + (bigFront.map { [$0] } ?? [])
     }
 
     /// Keeps click-through exact as the pointer moves. Removed in deep sleep, so mouse
@@ -323,40 +543,76 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Only the painted pixels of the cat and its toys catch clicks; everything else falls
     /// through to the app underneath.
     private func updateClickThrough() {
+        let t0 = Self.debug ? CACurrentMediaTime() : 0
+        defer { if Self.debug { timing.clickThrough += CACurrentMediaTime() - t0; timing.clicks += 1 } }
         guard dragging == nil, draggingExtra == nil, !deepSleep else { hideHint(); return }
         if laserOn { laserWindow.place(NSEvent.mouseLocation) }
-        let all: [NSWindow] = [catWindow, boneWindow, boxWindow, yarnWindow] + extras.map(\.window)
         if let t = toolbox, t.tool != .pointer {   // a Paint tool is active: the canvas gets every click
+            let all: [NSWindow] = [catWindow] + toyWindows + extras.map(\.window)
             for w in all where !w.ignoresMouseEvents { w.ignoresMouseEvents = true }
             hideHint()
             return
         }
         let p = NSEvent.mouseLocation
-        let hit = thing(at: p)
-        let hitExtra = hit == nil ? extras.firstIndex { catHit(p, $0.play.catPose, $0.sprites, $0.play.catScale, $0.window) } : nil
-        for (w, t) in [(catWindow as NSWindow, Thing.cat), (boneWindow, .bone), (boxWindow, .box), (yarnWindow, .yarn)] {
-            let ignore = hit != t
-            if w.ignoresMouseEvents != ignore { w.ignoresMouseEvents = ignore }   // each set is a WindowServer call
+        // Cats napping in the big box poke their heads out over its front: on a head, you get
+        // the cat (to lift it out); on the front, the box (with everyone in it).
+        let onBigFront = bigFront.map { f in f.isVisible && (toys.boxes.first.map { f.hit(p, center: $0.prop.body.pos) } ?? false) } ?? false
+        var hit = thing(at: p)
+        if hit == .cat, play.inBigBox, onBigFront { hit = nil }
+        let bigBoxExtra = hit == nil && !onBigFront ? extras.firstIndex { x in
+            x.inBigBox && catHit(p, x.pose, x.sprites, x.catScale, x.window)
+        } : nil
+        // The toy under the pointer: yarn, then bones (small, so a little slop), then boxes.
+        func under(_ ws: [PropWindow], _ props: [Prop], slop: Int) -> PropWindow? {
+            Array(zip(ws, props)).last { w, pr in w.isVisible && w.hit(p, center: pr.body.pos, slop: slop) }?.0
+        }
+        let hitToy = hit != nil || bigBoxExtra != nil ? nil
+            : under(yarnWindows, toys.yarns.map(\.prop), slop: 2) ?? under(boneWindows, toys.bones.map(\.prop), slop: 2)
+                ?? under(bowlWindows, toys.bowls.map(\.prop), slop: 2)
+                ?? under(bigFront.map { [$0] } ?? [], toys.boxes.prefix(1).map(\.prop), slop: 0)
+                ?? under(boxWindows, toys.boxes.map(\.prop), slop: 0)
+        // (Runs on every mouse move: rule out the cats nowhere near the pointer before working
+        // out their pose. `catHit` checks the same box around the pose's centre, the cat's position.)
+        let hitExtra = bigBoxExtra ?? (hit == nil && hitToy == nil ? extras.firstIndex { x in
+            let c = x.play.cat.position, s = x.catScale
+            guard abs(p.x - c.x) < 17 * s, abs(p.y - c.y) < 17 * s else { return false }
+            return catHit(p, x.pose, x.sprites, s, x.window)
+        } : nil)
+        let catIgnore = hit != .cat
+        if catWindow.ignoresMouseEvents != catIgnore { catWindow.ignoresMouseEvents = catIgnore }   // each set is a WindowServer call
+        for w in toyWindows {
+            let ignore = w !== hitToy
+            if w.ignoresMouseEvents != ignore { w.ignoresMouseEvents = ignore }
         }
         for (i, x) in extras.enumerated() {
             let ignore = hitExtra != i
             if x.window.ignoresMouseEvents != ignore { x.window.ignoresMouseEvents = ignore }
         }
-        // Hovering over a sleeping cat: tell people how to wake it.
-        var sleeper: (CGPoint, CGFloat)?
-        if hit == .cat, play.isSleeping { sleeper = (play.catPose.center, play.catScale) }
-        if let i = hitExtra, extras[i].play.isSleeping { sleeper = (extras[i].play.catPose.center, extras[i].play.catScale) }
-        if let (c, s) = sleeper {
+        // Hovering over a cat: its name and stats (and, if it's asleep, how to wake it).
+        var hovered: (id: Int, p: Playground)?
+        if hit == .cat { hovered = (0, play) }
+        if let i = hitExtra { hovered = (i + 1, extras[i].play) }
+        if let (id, p) = hovered {
             let now = CACurrentMediaTime()
-            if hoverSince == nil { hoverSince = now }
-            if now - hoverSince! > 0.4 { hintWindow.show(above: CGPoint(x: c.x, y: c.y + 14 * s)) }
+            if hoverSince == nil || hoverID != id { hoverSince = now; hoverID = id }
+            if now - hoverSince! > 0.4 {
+                var text = CatNames.name(id, custom: settings.catNames)
+                let s = catStats.summary(cat: id)
+                if !s.isEmpty { text += " · " + s }
+                if p.isSleeping { text += " · double-click to wake" }
+                hintWindow.setText(text)
+                hintWindow.show(above: CGPoint(x: p.catPose.center.x, y: p.catPose.center.y + 14 * p.catScale))
+            }
         } else {
             hideHint()
         }
     }
 
+    private var hoverID: Int?
+
     private func hideHint() {
         hoverSince = nil
+        hoverID = nil
         if hintWindow.isVisible { hintWindow.orderOut(nil) }
     }
 
@@ -370,9 +626,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func thing(at p: CGPoint) -> Thing? {
         if !noCat, catHit(p, play.catPose, sprites, play.catScale, catWindow) { return .cat }
-        if yarnWindow.isVisible, yarnWindow.hit(p, center: play.yarn.body.pos, slop: 2) { return .yarn }
-        if boneWindow.isVisible, boneWindow.hit(p, center: play.bone.body.pos, slop: 2) { return .bone }
-        if boxWindow.isVisible, boxWindow.hit(p, center: play.box.body.pos) { return .box }
         return nil
     }
 
@@ -395,10 +648,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             play.setCatSize(1)
             play.setScale(scale)
             catWindow.setScale(scale)
-            boneWindow.setScale(scale)
-            boxWindow.setScale(scale)
-            yarnWindow.setScale(scale)
+            for w in toyWindows { w.setScale(scale) }
+            syncBigBox()
             for x in extras { x.play.setScale(scale); x.window.setScale(scale) }
+            layOutHeap()
         }
         let night = settings.reacts && play.sleepy
         play.cat.speed = CGFloat(settings.speed.rawValue) * (night ? 0.75 : 1)
@@ -406,6 +659,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         play.spotWindows = settings.naps && settings.spotWindows
         play.spotMenuBar = settings.naps && settings.spotMenuBar
         play.spotDock = settings.naps && settings.spotDock
+        play.dockBonk = settings.dockBonk
         play.cat.position = play.cat.clamp(play.cat.position, cursor: NSEvent.mouseLocation,
                                            screens: NSScreen.screens.map(\.frame))
 
@@ -419,6 +673,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             x.play.paused = allPaused
             x.play.gravityMode = play.gravityMode
             x.play.sleepy = play.sleepy
+            x.play.dockBonk = settings.dockBonk
         }
         crowd?.paused = allPaused
         crowd?.speed = play.cat.speed
@@ -435,21 +690,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func restoreToys() {
-        if settings.boxOut {
-            if let p = settings.boxPosition, world.screen(containing: p) != nil {
-                play.placeBox(at: p, falling: false)
+        let saved = settings.boxPositions
+        for i in 0..<settings.realBoxCount {
+            if let p = saved[safe: i], world.screen(containing: p) != nil {
+                play.placeBox(at: p, falling: false, index: i)
             } else {
-                play.placeBox(at: dropPoint(offset: 120), falling: true)
+                play.placeBox(at: boxDropPoint(i), falling: true, index: i)
             }
         }
-        if settings.boneOut {
-            if let p = settings.bonePosition, world.screen(containing: p) != nil {
-                play.placeBone(at: p, falling: false)
+        layOutHeap()
+        let bones = settings.bonePositions
+        for i in 0..<settings.boneCount {
+            if let p = bones[safe: i], world.screen(containing: p) != nil {
+                play.placeBone(at: p, falling: false, index: i)
             } else {
-                play.placeBone(at: dropPoint(offset: -80), falling: true)
+                play.placeBone(at: toyDropPoint(i, offset: -80), falling: true, index: i)
             }
         }
-        if settings.yarnOut { play.placeYarn(at: dropPoint(offset: 60), falling: true) }
+        for i in 0..<settings.yarnCount { play.placeYarn(at: toyDropPoint(i, offset: 60), falling: true, index: i) }
+        let bowls = settings.bowlPositions
+        for i in 0..<settings.bowlCount {
+            if let p = bowls[safe: i], world.screen(containing: p) != nil {
+                play.placeBowl(at: p, falling: false, index: i)
+            } else {
+                play.placeBowl(at: toyDropPoint(i, offset: -160), falling: true, index: i)
+            }
+        }
         startPhysicsIfNeeded()
     }
 
@@ -460,10 +726,104 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return world.screen(containing: p) != nil ? p : c
     }
 
+    /// Where new box `i` drops in: a row (then rows) beside the cursor.
+    private func boxDropPoint(_ i: Int) -> CGPoint {
+        let s = play.scale
+        let p = dropPoint(offset: 120 + CGFloat(i % 10) * 34 * s)
+        return CGPoint(x: p.x, y: p.y + CGFloat(i / 10) * 40 * s)
+    }
+
+    /// Where new bone or ball of yarn `i` drops in: a row beside the cursor.
+    private func toyDropPoint(_ i: Int, offset: CGFloat) -> CGPoint {
+        let s = play.scale
+        let p = dropPoint(offset: offset + CGFloat(i % 10) * 22 * s * (offset < 0 ? -1 : 1))
+        return CGPoint(x: p.x, y: p.y + CGFloat(i / 10) * 24 * s)
+    }
+
+    /// Settings' bone and yarn counts onto the desktop.
+    func applyToyCounts() {
+        guard touchBar == nil else { touchBar?.setBone(settings.boneOut); return }
+        if toys.bones.count > settings.boneCount {
+            play.removeBones(keeping: settings.boneCount)
+            for x in extras { x.play.removeBones(keeping: settings.boneCount) }
+        }
+        for i in toys.bones.count..<max(toys.bones.count, settings.boneCount) {
+            play.placeBone(at: toyDropPoint(i, offset: -80), falling: true, index: i)
+        }
+        if toys.yarns.count > settings.yarnCount {
+            play.removeYarns(keeping: settings.yarnCount)
+            for x in extras { x.play.removeYarns(keeping: settings.yarnCount) }
+        }
+        for i in toys.yarns.count..<max(toys.yarns.count, settings.yarnCount) {
+            play.placeYarn(at: toyDropPoint(i, offset: 60), falling: true, index: i)
+        }
+        if toys.bowls.count > settings.bowlCount {
+            play.removeBowls(keeping: settings.bowlCount)
+            for x in extras { x.play.removeBowls(keeping: settings.bowlCount) }
+        }
+        for i in toys.bowls.count..<max(toys.bowls.count, settings.bowlCount) {
+            play.placeBowl(at: toyDropPoint(i, offset: -160), falling: true, index: i)
+        }
+        startPhysicsIfNeeded()
+        render()
+    }
+
+    /// Settings' box count onto the desktop: real boxes first, then the heap.
+    func applyBoxCount() {
+        guard touchBar == nil else { touchBar?.setBox(settings.boxOut); return }
+        let real = settings.realBoxCount
+        if toys.boxes.count > real {
+            play.removeBoxes(keeping: real)
+            for x in extras { x.play.removeBoxes(keeping: real) }
+        }
+        for i in toys.boxes.count..<max(toys.boxes.count, real) { play.placeBox(at: boxDropPoint(i), falling: true, index: i) }
+        toys.setBig(0, settings.bigBox)
+        layOutHeap()
+        startPhysicsIfNeeded()
+        render()
+    }
+
+    /// (Re)build the GPU heap for every box past the first 50.
+    private func layOutHeap() {
+        let n = touchBar == nil ? settings.heapBoxCount : 0
+        if n == 0 {
+            heap?.stop()
+            heap = nil
+            toys.heap = []
+            toys.heapNappers = [:]
+            crowd?.setHeap([])
+            return
+        }
+        let screens = NSScreen.screens.map(\.frame)
+        let positions = BoxHeap.layout(count: n, screens: screens, scale: CGFloat(settings.size.rawValue))
+        if positions.count < toys.heap.count { toys.heapNappers = toys.heapNappers.filter { $0.key < positions.count } }
+        toys.heap = positions
+        crowd?.setHeap(positions)
+        let h = heap ?? BoxHeap()
+        heap = h
+        h.show(positions, scale: CGFloat(settings.size.rawValue), screens: screens)
+    }
+
     private func savePositions() {
         settings.lastPosition = play.cat.position
-        if play.box.isResting || play.box.state == .pinned { settings.boxPosition = play.box.body.pos }
-        if play.bone.isResting || play.bone.state == .pinned { settings.bonePosition = play.bone.body.pos }
+        if !toys.boxes.isEmpty, touchBar == nil {
+            let old = settings.boxPositions
+            settings.boxPositions = toys.boxes.enumerated().map { i, b in
+                b.prop.isResting || b.prop.state == .pinned ? b.prop.body.pos : (old[safe: i] ?? b.prop.body.pos)
+            }
+        }
+        if !toys.bowls.isEmpty, touchBar == nil {
+            let old = settings.bowlPositions
+            settings.bowlPositions = toys.bowls.enumerated().map { i, b in
+                b.prop.isResting || b.prop.state == .pinned ? b.prop.body.pos : (old[safe: i] ?? b.prop.body.pos)
+            }
+        }
+        if !toys.bones.isEmpty, touchBar == nil {
+            let old = settings.bonePositions
+            settings.bonePositions = toys.bones.enumerated().map { i, b in
+                b.prop.isResting || b.prop.state == .pinned ? b.prop.body.pos : (old[safe: i] ?? b.prop.body.pos)
+            }
+        }
     }
 
     /// Where Neko lives: on the desktop, or only on the Touch Bar (never both).
@@ -476,21 +836,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if toolbox != nil { toggleToolbox() }      // the toolbox is a desktop thing
             savePositions()
             removeMouseMonitors()
-            for w in [catWindow as NSWindow, boneWindow, boxWindow, yarnWindow, laserWindow, hintWindow] + extras.map(\.window) {
+            for w in [catWindow as NSWindow, laserWindow, hintWindow] + toyWindows + extras.map(\.window) {
                 w.orderOut(nil)
             }
             crowd?.setVisible(false)
+            heap?.setVisible(false)
             let tb = touchBar ?? TouchBarCat(sprites: sprites, icon: classic.menuBarIcon())
             tb.setCats(min(settings.catCount, TouchBarCat.maxCats), sheets: (0..<TouchBarCat.maxCats).map(extraSheet),
                        behavior: settings.catBehavior)
             tb.onNeedsPhysics = { [weak self] in self?.startPhysicsIfNeeded() }
-            tb.onYeetToDesktop = { [weak self] along, v in self?.yeetFromTouchBar(along: along, velocity: v) }
-            tb.onEvent = { [weak self] e in self?.react(to: e, window: nil, primary: false) }
+            tb.onYeetToDesktop = { [weak self] along, v, cat in self?.yeetFromTouchBar(along: along, velocity: v, cat: cat) }
+            tb.onEvent = { [weak self] e in self?.react(to: e, window: nil, cat: nil) }
             tb.flickToDesktop = settings.flickToDesktop
             touchBar = tb
             tb.install()
             tb.show()
-            settings.boxOut = true          // the box always lives on the Touch Bar
+            if settings.boxCount == 0 { settings.boxCount = 1 }   // the box always lives on the Touch Bar
             tb.setBox(true)
             tb.setBone(settings.boneOut)
             setLogicRate(0.1)
@@ -498,10 +859,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             touchBar?.uninstall()
             touchBar = nil
             // Bring the desktop toys in line with what you chose while it was away.
-            if settings.boxOut && play.box.state == .hidden { play.placeBox(at: dropPoint(offset: 120), falling: true) }
-            if !settings.boxOut && play.box.state != .hidden { play.removeBox() }
-            if settings.boneOut && play.bone.state == .hidden { play.placeBone(at: dropPoint(offset: -80), falling: true) }
-            if !settings.boneOut && play.bone.state != .hidden { play.removeBone() }
+            applyBoxCount()
+            heap?.setVisible(true)
+            applyToyCounts()
             if !deepSleep { installMouseMonitors() }
             if !noCat { catWindow.orderFrontRegardless() }
             crowd?.setVisible(true)
@@ -531,6 +891,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                                object: nil, queue: .main) { [weak self] _ in
             self?.applySettings()   // re-clamp onto a display that still exists
             self?.toolbox?.rebuildCanvases()
+            self?.layOutHeap()      // the heap sits in each display's corner
         }
     }
 
@@ -565,14 +926,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(item(settings.paused ? "Resume" : "Pause", #selector(togglePause), key: "p"))
         menu.addItem(.separator())
 
-        let toys = NSMenu()
-        toys.addItem(item("Cardboard Box", #selector(toggleBox), checked: touchBar?.hasBox ?? (play.box.state != .hidden)))
-        toys.addItem(item("Bone", #selector(toggleBone), checked: touchBar?.hasBone ?? (play.bone.state != .hidden)))
-        toys.addItem(item("Ball of Yarn", #selector(toggleYarn), checked: play.yarn.state != .hidden, enabled: touchBar == nil))
-        toys.addItem(item("Laser Pointer", #selector(toggleLaser), checked: laserOn, enabled: touchBar == nil))
-        toys.addItem(.separator())
-        toys.addItem(item("Give Catnip", #selector(giveCatnip), enabled: touchBar == nil))
-        menu.addItem(submenu("Toys", toys))
+        let toyMenu = NSMenu()
+        let boxTitle = settings.boxCount > 1 && touchBar == nil ? "Cardboard Boxes (\(settings.boxCount.formatted()))" : "Cardboard Box"
+        toyMenu.addItem(item(boxTitle, #selector(toggleBox), checked: touchBar?.hasBox ?? settings.boxOut))
+        let boneTitle = settings.boneCount > 1 && touchBar == nil ? "Bones (\(settings.boneCount))" : "Bone"
+        toyMenu.addItem(item(boneTitle, #selector(toggleBone), checked: touchBar?.hasBone ?? settings.boneOut))
+        let yarnTitle = settings.yarnCount > 1 ? "Balls of Yarn (\(settings.yarnCount))" : "Ball of Yarn"
+        toyMenu.addItem(item(yarnTitle, #selector(toggleYarn), checked: settings.yarnOut, enabled: touchBar == nil))
+        toyMenu.addItem(item("Food Bowl", #selector(toggleBowl), checked: settings.bowlCount > 0, enabled: touchBar == nil))
+        toyMenu.addItem(item("Laser Pointer", #selector(toggleLaser), checked: laserOn, enabled: touchBar == nil))
+        toyMenu.addItem(.separator())
+        toyMenu.addItem(item("Give Catnip", #selector(giveCatnip), enabled: touchBar == nil))
+        menu.addItem(submenu("Toys", toyMenu))
         menu.addItem(item("Toolbox (Paint tools)", #selector(toggleToolbox), checked: toolbox != nil,
                           enabled: touchBar == nil))
         if TouchBarCat.isSupported {
@@ -585,6 +950,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(item("Settings…", #selector(showSettings), key: ","))
         menu.addItem(item("How to Play…", #selector(showWelcome)))
+        menu.addItem(item("What's New…", #selector(showWhatsNew)))
+        menu.addItem(item("Check for Updates…", #selector(checkForUpdates)))
         menu.addItem(item("About Oneko", #selector(showAbout)))
         menu.addItem(NSMenuItem(title: "Quit Oneko", action: #selector(NSApplication.terminate(_:)),
                                 keyEquivalent: "q"))
@@ -622,6 +989,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleSpotMenuBar() { settings.spotMenuBar.toggle(); applySettings() }
     @objc func toggleSpotDock() { settings.spotDock.toggle(); applySettings() }
     @objc func toggleIgnoreReduceMotion() { settings.ignoreReduceMotion.toggle(); applySettings() }
+    @objc func toggleDockBonk() { settings.dockBonk.toggle(); applySettings() }
     @objc func toggleHideInFullScreen() { settings.hideInFullScreen.toggle(); render() }
 
     @objc func chooseCustomSheet() {
@@ -654,43 +1022,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         render()
     }
 
+    /// Boxes on (as many as last time) or off.
     @objc func toggleBox() {
-        if let tb = touchBar {
-            settings.boxOut = !tb.hasBox
-            tb.setBox(settings.boxOut)
-            return
-        }
-        if play.box.state == .hidden {
-            play.placeBox(at: dropPoint(offset: 120), falling: true)
-            settings.boxOut = true
-        } else {
-            play.removeBox()
-            settings.boxOut = false
-        }
-        startPhysicsIfNeeded()
-        render()
+        let on = !(touchBar?.hasBox ?? settings.boxOut)
+        setBoxCount(on ? settings.lastBoxCount : 0)
     }
 
+    func setBoxCount(_ n: Int) {
+        settings.boxCount = n
+        applyBoxCount()
+    }
+
+    /// Bones on (as many as last time) or off.
     @objc func toggleBone() {
-        if let tb = touchBar {
-            settings.boneOut = !tb.hasBone
-            tb.setBone(settings.boneOut)
-            return
-        }
-        if play.bone.state == .hidden {
-            play.placeBone(at: dropPoint(offset: -80), falling: true)
-            settings.boneOut = true
-        } else {
-            play.removeBone()
-            settings.boneOut = false
-        }
-        startPhysicsIfNeeded()
-        render()
+        let on = !(touchBar?.hasBone ?? settings.boneOut)
+        setBoneCount(on ? settings.lastBoneCount : 0)
+    }
+
+    func setBoneCount(_ n: Int) {
+        settings.boneCount = n
+        applyToyCounts()
+    }
+
+    @objc func toggleBigBox() {
+        settings.bigBox.toggle()
+        applyBoxCount()
+    }
+
+    @objc func toggleBowl() { setBowlCount(settings.bowlCount > 0 ? 0 : 1) }
+
+    func setBowlCount(_ n: Int) {
+        settings.bowlCount = n
+        applyToyCounts()
+    }
+
+    func setYarnCount(_ n: Int) {
+        settings.yarnCount = n
+        applyToyCounts()
     }
 
     /// Flicked hard off the Touch Bar: Neko moves to the desktop, flying up out of the bottom
     /// of the built-in display (right above the Touch Bar). `v` is already scaled.
-    private func yeetFromTouchBar(along: CGFloat, velocity v: CGVector) {
+    /// `cat`: which of the bar's extra cats it was (nil: the first cat); the same cat flies up.
+    private func yeetFromTouchBar(along: CGFloat, velocity v: CGVector, cat: Int?) {
         setHome(touchBar: false)
         stats.bump(.touchBarTrips)
         sounds.play(.meow)
@@ -698,8 +1072,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let f = screen.frame, vis = screen.visibleFrame
         let start = CGPoint(x: f.minX + along * f.width, y: vis.minY + 20)
         world = WorldReader.read()
-        withPlay { $0.launch(at: start, velocity: v) }
-        catWindow.orderFrontRegardless()
+        if let i = cat, let x = extras[safe: i] {
+            x.play.launch(at: start, velocity: v)
+            x.window.orderFrontRegardless()
+            handleEvents()
+            startPhysicsIfNeeded()
+            render()
+        } else {
+            withPlay { $0.launch(at: start, velocity: v) }
+            catWindow.orderFrontRegardless()
+        }
     }
 
     @objc func liveOnDesktop() { setHome(touchBar: false) }
@@ -738,6 +1120,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func showWelcome() {
         let w = welcomeWindow ?? WelcomeWindow(icon: classic.image(for: .idle, frame: 0))
         welcomeWindow = w
+        w.present()
+    }
+
+    @objc func checkForUpdates() { updates.check(userAsked: true) }
+
+    private var whatsNewWindow: WhatsNewWindow?
+
+    @objc func showWhatsNew() {
+        let w = whatsNewWindow ?? WhatsNewWindow(icon: classic.image(for: .idle, frame: 0))
+        whatsNewWindow = w
         w.present()
     }
 
@@ -793,6 +1185,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         wantExtras = max(0, settings.realCatCount - 1)
         while extras.count > wantExtras {
             let x = extras.removeLast()
+            x.play.leaveBoxes()
             x.window.orderOut(nil)
         }
         growExtras()
@@ -801,6 +1194,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let c = crowd ?? CrowdController()
             crowd = c
             c.setCoats(crowdSheets())
+            c.setHeap(toys.heap)
             c.setCount(crowdCount, around: play.cat.position)
             c.setVisible(touchBar == nil)
         } else if let c = crowd {
@@ -845,6 +1239,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                        cursor: play.cat.position, screens: world.screenFrames)
             var p = Playground(position: start)
             p.spotWindows = false; p.spotMenuBar = false; p.spotDock = false
+            p.toys = toys                 // every cat shares the boxes
+            p.catID = i + 1
+            p.ownsToys = false             // the first cat's playground moves them
+            p.dockBonk = settings.dockBonk
+            p.laser = laserOn
             p.setScale(settings.size.rawValue)
             let x = ExtraCat(play: p, sprites: extraSheet(i))
             x.window.setScale(settings.size.rawValue)
@@ -911,17 +1310,82 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// What extra cat `i` runs after.
-    private func target(of i: Int) -> CGPoint {
+    /// What extra cat `i` runs after. `squash`: `swarmSquash`, worked out once per tick.
+    private func target(of i: Int, squash: CGFloat) -> CGPoint {
+        if laserOn {   // everyone piles onto the dot
+            let o = Self.swarmOffset(i, scale: play.scale)
+            return CGPoint(x: world.cursor.x + o.dx * 0.35, y: world.cursor.y + o.dy * 0.35)
+        }
         switch settings.catBehavior {
         case .conga:
             return i == 0 ? play.cat.position : extras[i - 1].play.cat.position
         case .swarm:
             let o = Self.swarmOffset(i, scale: play.scale)
-            return CGPoint(x: world.cursor.x + o.dx * swarmSquash, y: world.cursor.y + o.dy * swarmSquash)
+            return CGPoint(x: world.cursor.x + o.dx * squash, y: world.cursor.y + o.dy * squash)
         case .roam:
             return extras[i].roam ?? extras[i].play.cat.position
         }
+    }
+
+    // MARK: - Cats playing together
+
+    private func isPlaying(_ c: Int?) -> Bool {
+        guard let i = c else { return play.isPlaying }
+        return extras[safe: i]?.isPlaying ?? false
+    }
+
+    private func catPosition(_ c: Int?) -> CGPoint {
+        c.map { extras[$0].play.cat.position } ?? play.cat.position
+    }
+
+    private func withCat(_ c: Int?, _ f: (inout Playground) -> Void) {
+        if let i = c { f(&extras[i].play) } else { f(&play) }
+    }
+
+    /// Keep playing pairs facing each other; every 2 s, pair up idle cats sitting together.
+    private func updatePlay() {
+        playPairs.removeAll { a, b in
+            (a.map { $0 >= extras.count } ?? false) || (b.map { $0 >= extras.count } ?? false) || !isPlaying(a) || !isPlaying(b)
+        }
+        for (a, b) in playPairs {
+            let pa = catPosition(a), pb = catPosition(b)
+            withCat(a) { $0.partner = pb }
+            withCat(b) { $0.partner = pa }
+        }
+        guard settings.catsPlay, tickCount % 20 == 0, !extras.isEmpty else { return }
+        let slots: [Int?] = (noCat ? [] : [nil]) + extras.indices.map { Optional($0) }
+        var positions: [CGPoint] = []
+        var free: [Bool] = []
+        positions.reserveCapacity(slots.count)
+        free.reserveCapacity(slots.count)
+        for c in slots {
+            positions.append(catPosition(c))
+            free.append(c.map { extras[$0].canPlay } ?? play.canPlay)
+        }
+        for (i, j) in PlayMatcher.pairs(positions, free: free, radius: 50 * play.scale, chance: { Dice.roll($0) }) {
+            let kind = PlayKind.allCases.randomElement()!
+            let a = slots[i], b = slots[j]
+            withCat(a) { $0.startPlay(kind, with: positions[j], leader: true) }
+            withCat(b) { $0.startPlay(kind, with: positions[i], leader: false) }
+            playPairs.append((a, b))
+        }
+    }
+
+    // MARK: - Weather
+
+    /// The weather (or none), on every display that isn't running something full screen.
+    func updateSeason() {
+        if settings.weather == "live", touchBar == nil, !deepSleep { LiveWeather.shared.refreshIfDue() }
+        guard touchBar == nil, !deepSleep, let w = SeasonOverlay.weather(settings.weather, live: LiveWeather.shared.current) else {
+            season?.stop()
+            season = nil
+            return
+        }
+        if season?.current != w {
+            season?.stop()
+            season = SeasonOverlay(w, thunder: { [weak self] in self?.sounds.play(.thunder) })
+        }
+        season?.update(screens: world.screenFrames, hidden: settings.hideInFullScreen ? world.fullScreenDisplays : [])
     }
 
     /// Free roam: every now and then each cat picks somewhere new to wander to.
@@ -929,7 +1393,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard settings.catBehavior == .roam, !world.screens.isEmpty else { return }
         for x in extras {
             let there = x.roam.map { hypot($0.x - x.play.cat.position.x, $0.y - x.play.cat.position.y) < x.play.cat.stopDistance + 4 } ?? true
-            if x.roam == nil || (there && Int.random(in: 0..<120) == 0) || Int.random(in: 0..<900) == 0 {
+            if x.roam == nil || (there && Dice.roll(120) == 0) || Dice.roll(900) == 0 {   // (every cat, every tick)
                 let s = world.screens[Int.random(in: 0..<world.screens.count)].visible.insetBy(dx: 40, dy: 40)
                 guard s.width > 0, s.height > 0 else { continue }
                 x.roam = CGPoint(x: CGFloat.random(in: s.minX...s.maxX), y: CGFloat.random(in: s.minY...s.maxY))
@@ -947,9 +1411,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func tickExtras() {
         growExtras()
         updateRoaming()
+        let squash = swarmSquash
+        var w = world
+        w.pointer = world.cursor   // bones come back to you, not to their spot
         for (i, x) in extras.enumerated() {
-            var w = world
-            w.cursor = target(of: i)
+            w.cursor = target(of: i, squash: squash)
             x.play.tick10(world: w)
         }
         crowd?.behavior = settings.catBehavior
@@ -958,12 +1424,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     covered: settings.hideInFullScreen ? world.fullScreenDisplays : [])
     }
 
+    /// ⌥-click a cat: give it a name of your own (empty: its own name back). `id` 0 is the
+    /// first cat, then the extra cats in order.
+    func renameCat(_ id: Int) {
+        hideHint()
+        let alert = NSAlert()
+        alert.messageText = "Rename \(CatNames.name(id, custom: settings.catNames))"
+        alert.informativeText = "Leave it empty to go back to \(CatNames.name(id))."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        field.stringValue = settings.catNames[String(id)] ?? ""
+        field.placeholderString = CatNames.name(id)
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        var names = settings.catNames
+        let n = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        names[String(id)] = n.isEmpty ? nil : String(n.prefix(40))
+        settings.catNames = names
+        settingsWindow?.refresh()
+    }
+
     private func wire(extra x: ExtraCat, index i: Int) {
         let v = x.window.mouseView
+        v.onOptionClick = { [weak self, weak x] in
+            guard let self, let x, let i = extras.firstIndex(where: { $0 === x }) else { return }
+            renameCat(i + 1)
+        }
         v.onDown = { [weak self, weak x] p, t in
             guard let self, let x else { return }
             draggingExtra = extras.firstIndex { $0 === x }
-            x.play.mouseDown(on: .cat, at: p, time: t)
+            // Shut in a box: grabbing the cat grabs the box (with the cat inside).
+            x.play.mouseDown(on: x.play.inBox && x.play.boxClosed ? .box : .cat, at: p, time: t)
         }
         v.onDrag = { [weak self, weak x] p, t in
             x?.play.mouseDragged(to: p, time: t)
@@ -976,6 +1470,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             draggingExtra = nil
             handleEvents()
             startPhysicsIfNeeded()
+            reseat = x.window
             render()
             updateClickThrough()
         }
@@ -991,20 +1486,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - Toys: yarn, laser, catnip
 
     @objc func toggleYarn() {
-        if play.yarn.state == .hidden {
-            play.placeYarn(at: dropPoint(offset: 60), falling: true)
-            settings.yarnOut = true
-        } else {
-            play.removeYarn()
-            settings.yarnOut = false
-        }
-        startPhysicsIfNeeded()
-        render()
+        setYarnCount(settings.yarnOut ? 0 : settings.lastYarnCount)
     }
 
     @objc func toggleLaser() {
         laserOn.toggle()
         play.laser = laserOn
+        for x in extras { x.play.laser = laserOn }   // every cat goes after the dot
         if laserOn { laserWindow.place(NSEvent.mouseLocation) }
         render()
     }
@@ -1114,9 +1602,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var droppingIntoTouchBar = false
 
-    private func maybeDropIntoTouchBar(impact: CGFloat, onWindow: Int?, at p: CGPoint) {
+    /// Any cat can be slammed through: `cat` is which extra (nil: the first cat), and the
+    /// same cat drops onto the bar (if the bar has that many cats).
+    private func maybeDropIntoTouchBar(impact: CGFloat, onWindow: Int?, at p: CGPoint, cat: Int?) {
+        let thrown = cat.flatMap { extras[safe: $0]?.play.lastThrow } ?? play.lastThrow
         guard settings.slamToTouchBar, TouchBarCat.isSupported, touchBar == nil, !droppingIntoTouchBar, onWindow == nil,
-              Self.slamsIntoTouchBar(impact: impact, thrown: play.lastThrow),
+              Self.slamsIntoTouchBar(impact: impact, thrown: thrown),
               let screen = builtInScreen, p.x >= screen.frame.minX, p.x <= screen.frame.maxX,
               p.y >= screen.frame.minY, p.y <= screen.frame.minY + screen.frame.height / 2
         else { return }
@@ -1128,7 +1619,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let self else { return }
             droppingIntoTouchBar = false
             setHome(touchBar: true)
-            touchBar?.arrive(along: along)
+            touchBar?.arrive(along: along, cat: cat)
         }
     }
 
@@ -1148,7 +1639,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             t.show()
             withPlay { $0.gravityMode = true }   // Neko now falls, and walks on what you draw
             // Drawings sit under the cat and its toys.
-            for w in [boxWindow as NSWindow, boneWindow, catWindow] where w.isVisible { w.orderFrontRegardless() }
+            for w in toyWindows + [catWindow] where w.isVisible { w.orderFrontRegardless() }
             t.toolbar.orderFrontRegardless()
         }
         updateClickThrough()
@@ -1208,8 +1699,13 @@ final class ExtraCat {
         self.play = play
         self.sprites = sprites
     }
-}
 
-extension Array {
-    subscript(safe i: Int) -> Element? { indices.contains(i) ? self[i] : nil }
+    // Read-only looks at `play`, for the loops over every cat. `x.play.catPose` would copy the
+    // whole playground (a big struct) first; these read it in place (see `Playground.pose`).
+    var pose: CatPose { Playground.pose(&play) }
+    var needsPhysics: Bool { Playground.needsPhysics(&play) }
+    var catScale: CGFloat { Playground.catScale(&play) }
+    var canPlay: Bool { Playground.canPlay(&play) }
+    var isPlaying: Bool { Playground.isPlaying(&play) }
+    var inBigBox: Bool { Playground.inBigBox(&play) }
 }

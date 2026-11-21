@@ -52,7 +52,24 @@ final class Settings {
             Key.paintFill: "F5A142",
             Key.paintAccent: "FFFFFF",
             Key.paintPattern: CoatPattern.tabby.rawValue,
+            Key.dockBonk: true,
+            Key.catsPlay: true,
+            Key.weather: "live",
+            Key.autoUpdateCheck: true,
         ])
+        // 0.5.7: one box became any number of toys.
+        if defaults.object(forKey: Key.boxCount) == nil {
+            defaults.set(defaults.bool(forKey: Key.boxOut) ? 1 : 0, forKey: Key.boxCount)
+            if let p = point(Key.boxX, Key.boxY) { boxPositions = [p] }
+        }
+        // 0.5.8: one bone / one ball of yarn became any number.
+        if defaults.object(forKey: Key.boneCount) == nil {
+            defaults.set(defaults.bool(forKey: Key.boneOut) ? 1 : 0, forKey: Key.boneCount)
+            if let p = point(Key.boneX, Key.boneY) { bonePositions = [p] }
+        }
+        if defaults.object(forKey: Key.yarnCount) == nil {
+            defaults.set(defaults.bool(forKey: Key.yarnOut) ? 1 : 0, forKey: Key.yarnCount)
+        }
     }
 
     var speed: Speed {
@@ -76,8 +93,95 @@ final class Settings {
     var spotMenuBar: Bool { get { bool(Key.spotMenuBar) } set { set(newValue, Key.spotMenuBar) } }
     var spotDock: Bool { get { bool(Key.spotDock) } set { set(newValue, Key.spotDock) } }
 
-    var boxOut: Bool { get { bool(Key.boxOut) } set { set(newValue, Key.boxOut) } }
-    var boneOut: Bool { get { bool(Key.boneOut) } set { set(newValue, Key.boneOut) } }
+    /// Real boxes (you can carry, throw and shut them) stop here; the rest are a heap on
+    /// the floor drawn by the graphics chip.
+    static let maxRealBoxes = 50
+    static let maxBoxes = 1_000_000
+
+    /// How many cardboard boxes are out (0 = none), up to a million.
+    var boxCount: Int {
+        get { max(0, min(Self.maxBoxes, defaults.integer(forKey: Key.boxCount))) }
+        set {
+            let n = max(0, min(Self.maxBoxes, newValue))
+            if n > 0 { defaults.set(n, forKey: Key.lastBoxCount) }
+            defaults.set(n, forKey: Key.boxCount)
+        }
+    }
+    /// The count to bring back when you turn boxes on again from the menu.
+    var lastBoxCount: Int { max(1, min(Self.maxBoxes, defaults.integer(forKey: Key.lastBoxCount))) }
+    var realBoxCount: Int { min(boxCount, Self.maxRealBoxes) }
+    var heapBoxCount: Int { max(0, boxCount - Self.maxRealBoxes) }
+    var boxOut: Bool { boxCount > 0 }
+    /// Where the real boxes were left (global, y-up).
+    var boxPositions: [CGPoint] {
+        get { points(Key.boxPositions) }
+        set { setPoints(newValue, Key.boxPositions) }
+    }
+    /// The first box is a big one that fits 4 cats.
+    var bigBox: Bool { get { bool(Key.bigBox) } set { set(newValue, Key.bigBox) } }
+    /// "auto" (snow in winter, leaves in autumn), "off", "snow" or "leaves".
+    var weather: String {
+        get { defaults.string(forKey: Key.weather) ?? "live" }
+        set { defaults.set(newValue, forKey: Key.weather) }
+    }
+    /// Look for a newer Oneko on GitHub once a day.
+    var autoUpdateCheck: Bool { get { bool(Key.autoUpdateCheck) } set { set(newValue, Key.autoUpdateCheck) } }
+    var lastUpdateCheck: Date? {
+        get { defaults.object(forKey: Key.lastUpdateCheck) as? Date }
+        set { defaults.set(newValue, forKey: Key.lastUpdateCheck) }
+    }
+    /// "Skip This Version": don't offer this one again (checking from the menu still shows it).
+    var skippedVersion: String? {
+        get { defaults.string(forKey: Key.skippedVersion) }
+        set { defaults.set(newValue, forKey: Key.skippedVersion) }
+    }
+    /// Names you gave cats (cat id -> name; cat 0 is the first cat).
+    var catNames: [String: String] {
+        get { defaults.dictionary(forKey: Key.catNames) as? [String: String] ?? [:] }
+        set { defaults.set(newValue, forKey: Key.catNames) }
+    }
+    /// Cats sitting next to each other now and then groom, play-fight or chase each other.
+    var catsPlay: Bool { get { bool(Key.catsPlay) } set { set(newValue, Key.catsPlay) } }
+    /// An auto-hiding Dock popping up bonks cats (and toys) sitting where it appears.
+    var dockBonk: Bool { get { bool(Key.dockBonk) } set { set(newValue, Key.dockBonk) } }
+    /// Bones and balls of yarn: each one is a real toy (its own little window), up to 50.
+    static let maxBones = 50
+    static let maxYarns = 50
+    var boneCount: Int {
+        get { max(0, min(Self.maxBones, defaults.integer(forKey: Key.boneCount))) }
+        set {
+            let n = max(0, min(Self.maxBones, newValue))
+            if n > 0 { defaults.set(n, forKey: Key.lastBoneCount) }
+            defaults.set(n, forKey: Key.boneCount)
+        }
+    }
+    var lastBoneCount: Int { max(1, min(Self.maxBones, defaults.integer(forKey: Key.lastBoneCount))) }
+    var boneOut: Bool { boneCount > 0 }
+    var yarnCount: Int {
+        get { max(0, min(Self.maxYarns, defaults.integer(forKey: Key.yarnCount))) }
+        set {
+            let n = max(0, min(Self.maxYarns, newValue))
+            if n > 0 { defaults.set(n, forKey: Key.lastYarnCount) }
+            defaults.set(n, forKey: Key.yarnCount)
+        }
+    }
+    var lastYarnCount: Int { max(1, min(Self.maxYarns, defaults.integer(forKey: Key.lastYarnCount))) }
+    /// Food bowls (cats get hungry every 20–40 minutes).
+    static let maxBowls = 10
+    var bowlCount: Int {
+        get { max(0, min(Self.maxBowls, defaults.integer(forKey: Key.bowlCount))) }
+        set { defaults.set(max(0, min(Self.maxBowls, newValue)), forKey: Key.bowlCount) }
+    }
+    var bowlPositions: [CGPoint] {
+        get { points(Key.bowlPositions) }
+        set { setPoints(newValue, Key.bowlPositions) }
+    }
+    var yarnOut: Bool { yarnCount > 0 }
+    /// Where the bones were left (global, y-up).
+    var bonePositions: [CGPoint] {
+        get { points(Key.bonePositions) }
+        set { setPoints(newValue, Key.bonePositions) }
+    }
     var touchBarCat: Bool { get { bool(Key.touchBarCat) } set { set(newValue, Key.touchBarCat) } }
 
     var sound: Bool { get { bool(Key.sound) } set { set(newValue, Key.sound) } }
@@ -143,6 +247,16 @@ final class Settings {
         get { defaults.stringArray(forKey: Key.customCoats) ?? [] }
         set { defaults.set(newValue, forKey: Key.customCoats) }
     }
+    /// The version whose What's New window was last shown (nil: before 0.5.7, or never).
+    var lastSeenVersion: String? {
+        get { defaults.string(forKey: Key.lastSeenVersion) }
+        set { defaults.set(newValue, forKey: Key.lastSeenVersion) }
+    }
+    /// Show What's New on this launch? Only after an update: a fresh install gets How to
+    /// Play instead, and each version is shown once.
+    func shouldShowWhatsNew(current: String) -> Bool {
+        seenWelcome && lastSeenVersion != current
+    }
     /// The How to Play window has been shown once.
     var seenWelcome: Bool { get { bool(Key.seenWelcome) } set { set(newValue, Key.seenWelcome) } }
     /// "auto" (seasonal), "none", "santa", "witch", "party".
@@ -152,7 +266,6 @@ final class Settings {
     }
     /// Naps while you're away, sleepy late at night.
     var reacts: Bool { get { bool(Key.reacts) } set { set(newValue, Key.reacts) } }
-    var yarnOut: Bool { get { bool(Key.yarnOut) } set { set(newValue, Key.yarnOut) } }
     /// Throwing the cat down hard on the MacBook's screen drops it into the Touch Bar.
     var slamToTouchBar: Bool { get { bool(Key.slamToTouchBar) } set { set(newValue, Key.slamToTouchBar) } }
     /// Flicking the cat up off the Touch Bar sends it to the desktop.
@@ -191,20 +304,20 @@ final class Settings {
         set { setPoint(newValue, Key.posX, Key.posY) }
     }
 
-    var boxPosition: CGPoint? {
-        get { point(Key.boxX, Key.boxY) }
-        set { setPoint(newValue, Key.boxX, Key.boxY) }
-    }
-
-    var bonePosition: CGPoint? {
-        get { point(Key.boneX, Key.boneY) }
-        set { setPoint(newValue, Key.boneX, Key.boneY) }
-    }
 
     // MARK: - Storage
 
     private func bool(_ k: String) -> Bool { defaults.bool(forKey: k) }
     private func set(_ v: Bool, _ k: String) { defaults.set(v, forKey: k) }
+
+    private func points(_ k: String) -> [CGPoint] {
+        let a = defaults.array(forKey: k) as? [Double] ?? []
+        return stride(from: 0, to: a.count - 1, by: 2).map { CGPoint(x: a[$0], y: a[$0 + 1]) }
+    }
+
+    private func setPoints(_ p: [CGPoint], _ k: String) {
+        defaults.set(p.flatMap { [Double($0.x), Double($0.y)] }, forKey: k)
+    }
 
     private func point(_ kx: String, _ ky: String) -> CGPoint? {
         guard defaults.object(forKey: kx) != nil else { return nil }
@@ -235,5 +348,12 @@ final class Settings {
         static let paintPattern = "paintPattern"
         static let crowdMode = "crowdMode", catBehavior = "catBehavior", coatMode = "coatMode"
         static let customCoats = "customCoats", seenWelcome = "seenWelcome"
+        static let boxCount = "boxCount", lastBoxCount = "lastBoxCount", boxPositions = "boxPositions"
+        static let dockBonk = "dockBonk", lastSeenVersion = "lastSeenVersion"
+        static let boneCount = "boneCount", lastBoneCount = "lastBoneCount", bonePositions = "bonePositions"
+        static let yarnCount = "yarnCount", lastYarnCount = "lastYarnCount"
+        static let bowlCount = "bowlCount", bowlPositions = "bowlPositions"
+        static let bigBox = "bigBox", catsPlay = "catsPlay", weather = "weather", catNames = "catNames"
+        static let autoUpdateCheck = "autoUpdateCheck", lastUpdateCheck = "lastUpdateCheck", skippedVersion = "skippedVersion"
     }
 }

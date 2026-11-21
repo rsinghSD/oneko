@@ -187,6 +187,33 @@ enum PixelArt {
         " ##          ## ",
     ], palette: ["#": RGBA(r: 0, g: 0, b: 0), "o": RGBA(r: 255, g: 255, b: 255)])
 
+    // MARK: - Food bowl
+
+    private static let bowlPalette: [Character: RGBA] = [
+        "#": RGBA(r: 30, g: 60, b: 110), "b": RGBA(r: 70, g: 130, b: 220), "l": RGBA(r: 140, g: 190, b: 250),
+        "f": RGBA(r: 176, g: 108, b: 54), "d": RGBA(r: 120, g: 70, b: 32),
+    ]
+    /// A food bowl full of kibble...
+    static let bowlFull = fromRows([
+        "   ffdffdfffd   ",
+        "  fdffffdfffdf  ",
+        " ############## ",
+        "#llllllllllllll#",
+        "#bbbbbbbbbbbbbb#",
+        " #bbbbbbbbbbbb# ",
+        "  ############  ",
+    ], palette: bowlPalette)
+    /// ...and licked clean.
+    static let bowlEmpty = fromRows([
+        "                ",
+        "                ",
+        " ############## ",
+        "#llllllllllllll#",
+        "#bbbbbbbbbbbbbb#",
+        " #bbbbbbbbbbbb# ",
+        "  ############  ",
+    ], palette: bowlPalette)
+
     // MARK: - Cardboard box (32×32, same grid as a cat sprite)
 
     private static let ink = RGBA(r: 74, g: 47, b: 24)

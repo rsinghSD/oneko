@@ -66,7 +66,7 @@ struct NekoBrain {
     private var pausedFrame = 0
 
     /// Injectable so tests can be deterministic. Returns 0..<upperBound.
-    var random: (Int) -> Int = { Int.random(in: 0..<$0) }
+    var random: (Int) -> Int = { n in var g = Dice.Generator(); return Int.random(in: 0..<n, using: &g) }
 
     init(position: CGPoint) {
         self.position = position
@@ -133,12 +133,14 @@ struct NekoBrain {
 
     /// One of the 8 running directions. diffX > 0: target is west; diffY > 0: target is north.
     static func direction(diffX: CGFloat, diffY: CGFloat, distance: CGFloat) -> SpriteName {
-        var dir = ""
-        if diffY / distance > 0.5 { dir += "N" }
-        if diffY / distance < -0.5 { dir += "S" }
-        if diffX / distance > 0.5 { dir += "W" }
-        if diffX / distance < -0.5 { dir += "E" }
-        return SpriteName(rawValue: dir) ?? .idle
+        // (A switch, not building "N" + "W" and parsing it: this runs for every cat, every step.)
+        let y = diffY / distance, x = diffX / distance
+        let north = y > 0.5, south = y < -0.5, west = x > 0.5, east = x < -0.5
+        switch (north, south) {
+        case (true, _): return west ? .NW : east ? .NE : .N
+        case (_, true): return west ? .SW : east ? .SE : .S
+        default: return west ? .W : east ? .E : .idle
+        }
     }
 
     /// Called when we resume, so the cat looks up before it runs off.

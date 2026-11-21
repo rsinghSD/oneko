@@ -105,6 +105,26 @@ extension SelfTest {
         q.launch(at: CGPoint(x: wide.midX, y: 400), velocity: .zero)
         for _ in 0..<240 { q.physics(dt: 1.0 / 60, world: w) }
         check(abs(q.cat.position.y - (62 + 16 - 3)) < 1, "over the Dock it lands on top of it (y=\(Int(q.cat.position.y)))")
+
+        // A cat's window (twice the cat, room to spin) stays on the display under the cat,
+        // the art shifted within it so it doesn't move: near the shared edge it used to hang
+        // over onto the other display, where macOS (one Space per display) clipped or hid it.
+        func fitted(_ c: CGPoint) -> (frame: CGRect, art: CGPoint) {
+            let o = CGPoint(x: (c.x - 64).rounded(), y: (c.y - 64).rounded())
+            let (origin, shift) = OverlayPanel.fit(origin: o, side: 128, center: c, displays: both)
+            return (CGRect(origin: origin, size: CGSize(width: 128, height: 128)),
+                    CGPoint(x: origin.x + 64 + shift.x, y: origin.y + 64 + shift.y))
+        }
+        for c in [CGPoint(x: 10, y: 300), CGPoint(x: 30, y: 1100), CGPoint(x: 26, y: 26), CGPoint(x: -20, y: 500),
+                  CGPoint(x: -1650, y: 1030), CGPoint(x: 3420, y: 1420)] {
+            let f = fitted(c)
+            let home = both.first { $0.contains(c) }!
+            check(home.contains(f.frame) && f.art == CGPoint(x: c.x.rounded(), y: c.y.rounded()),
+                  "a cat at \(c) keeps its window on its own display, drawn where it is (\(f.frame))")
+        }
+        let mid = fitted(CGPoint(x: 700, y: 500))
+        check(mid.frame.origin == CGPoint(x: 636, y: 436) && mid.art == CGPoint(x: 700, y: 500),
+              "away from the edges the window is centred on the cat, as before")
     }
 }
 

@@ -1,10 +1,10 @@
 import AppKit
 
 /// Neko's noises, synthesised in code at first use (no audio files): a purr for pets, a
-/// mrrp for yeets and box hops, a meow on waking, a thud on hard landings, and a sleepy
-/// sigh when it dozes off.
+/// mrrp for yeets and box hops, a meow on waking, a thud on hard landings, a sleepy
+/// sigh when it dozes off, and thunder rolling in a storm.
 final class SoundBox {
-    enum Kind: CaseIterable { case purr, meow, mrrp, thud, sleep }
+    enum Kind: CaseIterable { case purr, meow, mrrp, thud, sleep, thunder }
 
     var enabled = false
     var volume: Float = 0.6
@@ -17,12 +17,13 @@ final class SoundBox {
     func play(_ kind: Kind) {
         guard enabled else { return }
         let now = CACurrentMediaTime()
-        let gap: Double = kind == .purr ? 1.1 : kind == .sleep ? 4 : 0.25
+        let gap: Double = kind == .purr ? 1.1 : kind == .sleep ? 4 : kind == .thunder ? 3 : 0.25
         if let l = lastPlayed[kind], now - l < gap { return }
         lastPlayed[kind] = now
         let s = sound(kind)
         s.stop()
-        s.volume = volume * (kind == .sleep ? 0.7 : 1)   // dozing off is a quiet one
+        // Dozing off is a quiet one; thunder stays in the background, under whatever you're playing.
+        s.volume = volume * (kind == .sleep ? 0.7 : kind == .thunder ? 0.45 : 1)
         s.play()
     }
 
@@ -34,6 +35,7 @@ final class SoundBox {
         case .mrrp: return mrrp()
         case .thud: return thud()
         case .sleep: return sleep()
+        case .thunder: return thunder()
         }
     }
 
@@ -158,6 +160,28 @@ final class SoundBox {
         }
     }
 
+    /// Thunder some way off: a soft crack, then a low rumble that rolls a few times and
+    /// fades. Low and soft, so it sits in the background.
+    private static func thunder() -> [Float] {
+        var rng = SystemRandomNumberGenerator()
+        var lp1: Float = 0, lp2: Float = 0, hp: Float = 0, crack: Float = 0
+        let rolls = (0..<5).map { _ in (at: Float.random(in: 0.04...0.65, using: &rng), height: Float.random(in: 0.4...1, using: &rng)) }
+        var s = render(4.2) { t, p in
+            let n = Float.random(in: -1...1, using: &rng)
+            lp1 += 0.03 * (n - lp1)                 // brown-ish noise: the rumble
+            lp2 += 0.03 * (lp1 - lp2)
+            hp += 0.002 * (lp2 - hp)                // minus the sub-bass speakers can't play
+            var swell: Float = 0.3
+            for r in rolls where p > r.at { swell += r.height * exp(-(p - r.at) * 7) }
+            crack += 0.6 * (n - crack)
+            let snap = crack * max(0, 1 - t * 10) * 0.12
+            return ((lp2 - hp) * swell * exp(-p * 1.3) + snap) * envelope(p, attack: 0.005, release: 0.35)
+        }
+        let peak = s.map(abs).max() ?? 1
+        if peak > 0 { s = s.map { $0 / peak * 0.6 } }
+        return s
+    }
+
     private static func wav(_ samples: [Float]) -> Data {
         var d = Data()
         func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
@@ -176,7 +200,7 @@ final class SoundBox {
 /// Neko's lifetime stats, kept in UserDefaults.
 final class Stats {
     enum Key: String, CaseIterable {
-        case pets, yeets, fetches, windowBonks, dockYeets, boxNaps, yarnBats, touchBarTrips, highestYeet
+        case pets, yeets, fetches, windowBonks, dockYeets, boxNaps, yarnBats, touchBarTrips, meals, playdates, highestYeet
         var title: String {
             switch self {
             case .pets: return "Pets"
@@ -187,6 +211,8 @@ final class Stats {
             case .boxNaps: return "Box naps"
             case .yarnBats: return "Yarn bats"
             case .touchBarTrips: return "Touch Bar trips"
+            case .meals: return "Meals"
+            case .playdates: return "Playdates"
             case .highestYeet: return "Highest yeet"
             }
         }

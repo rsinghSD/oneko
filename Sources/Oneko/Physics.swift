@@ -30,8 +30,11 @@ struct World {
     var screens: [ScreenInfo]
     /// On-screen app windows, frontmost first.
     var windows: [WindowInfo]
+    /// Where this cat is headed (your cursor, or its spot in a swarm or conga line).
     var cursor: CGPoint
     var mouseDown = false
+    /// Your actual cursor, when `cursor` is something else (bones come back to you).
+    var pointer: CGPoint? = nil
     var frontmostPID: Int32 = 0
     /// Toolbox drawings (solid ones are physical).
     var drawings: [Drawing] = []
@@ -200,7 +203,12 @@ enum Physics {
         var support: Int?
         for d in world.drawings where d.solid {
             let reach = r + d.width / 2
-            for (a, e) in d.segments {
+            // The same segments as `d.segments` (each point to the next, and back to the
+            // start if it's closed), without building that array every step.
+            let pts = d.points
+            guard pts.count >= 2 else { continue }
+            for k in 0..<(d.closed ? pts.count : pts.count - 1) {
+                let a = pts[k], e = pts[k + 1 == pts.count ? 0 : k + 1]
                 let abx = e.x - a.x, aby = e.y - a.y
                 let len = hypot(abx, aby)
                 guard len > 0.5 else { continue }

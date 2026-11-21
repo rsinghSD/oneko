@@ -100,6 +100,8 @@ enum SelfTest {
         extrasChecks(check)
         displayChecks(check)
         catCountChecks(check)
+        boxChecks(check)
+        sharedToyChecks(check)
 
         print(ok ? "All checks passed." : "Some checks failed.")
         return ok
@@ -361,14 +363,34 @@ extension SelfTest {
         }
         check(dipYeets == 0 && dip.cat.position.y >= 60 + 13 - 0.01,
               "chasing a cursor just above the Dock never yeets it (it stays on top, y=\(Int(dip.cat.position.y)))")
-        // A Dock that appears under a resting cat lifts it instead of yeeting it.
+        // With the Dock bonk off, a Dock that appears under a resting cat lifts it instead.
         var lift = Playground(position: CGPoint(x: 500, y: 40))
         quiet(&lift)
+        lift.dockBonk = false
         lift.mouseDown(on: .cat, at: lift.cat.position, time: 0)
         lift.mouseUp(at: lift.cat.position, time: 0.05, clickCount: 2)   // stay
         lift.tick10(world: World(screens: [scr], windows: [], cursor: .zero))
         lift.tick10(world: World(screens: [docked], windows: [], cursor: .zero))
-        check(lift.mode != .flying && abs(lift.cat.position.y - 73) < 0.01, "a Dock appearing under a resting cat lifts it onto the Dock")
+        check(lift.mode != .flying && abs(lift.cat.position.y - 73) < 0.01, "Dock bonk off: a Dock appearing under a resting cat lifts it onto the Dock")
+        // On (the default): an auto-hiding Dock popping up under it bonks it into the air.
+        var bonk = Playground(position: CGPoint(x: 500, y: 40))
+        quiet(&bonk)
+        bonk.placeBone(at: CGPoint(x: 560, y: 13 + 3.5), falling: false)
+        bonk.mouseDown(on: .cat, at: bonk.cat.position, time: 0)
+        bonk.mouseUp(at: bonk.cat.position, time: 0.05, clickCount: 2)   // stay
+        bonk.tick10(world: World(screens: [scr], windows: [], cursor: .zero))
+        _ = bonk.drainEvents()
+        bonk.tick10(world: World(screens: [docked], windows: [], cursor: .zero))
+        check(bonk.mode == .flying && bonk.catBody.vel.dy > 1000 && bonk.drainEvents().contains(.dockBonk),
+              "Dock bonk on: the Dock popping up under a cat bonks it up into the air")
+        check(bonk.bone.state == .flying, "...and the toys sitting there too")
+        // ...but not on the very first look at the Dock (just launched, Dock already up).
+        var first = Playground(position: CGPoint(x: 500, y: 40))
+        quiet(&first)
+        first.mouseDown(on: .cat, at: first.cat.position, time: 0)
+        first.mouseUp(at: first.cat.position, time: 0.05, clickCount: 2)
+        first.tick10(world: World(screens: [docked], windows: [], cursor: .zero))
+        check(first.mode != .flying, "...and never on the first tick after launch")
         // After a Dock yeet there's a grace period: no yeet loop.
         var loop = Playground(position: CGPoint(x: 500, y: 30))
         quiet(&loop)
@@ -548,7 +570,7 @@ extension SelfTest {
             q.physics(dt: 1.0 / 60, world: world(.zero))
             q.tick10(world: world(CGPoint(x: 100, y: 800)))
         }
-        check(q.chooseSpot(world(.zero)) == nil || q.chooseSpot(world(.zero))?.kind != .box, "an empty closed box isn't a nap spot")
+        check(!(q.chooseSpot(world(.zero))?.kind.isBox ?? false), "an empty closed box isn't a nap spot")
 
         // R. Throw the cat, then catch it in the box you're holding, and carry it off.
         var r = Playground(position: CGPoint(x: 700, y: 600))
@@ -1015,7 +1037,437 @@ extension SelfTest {
 
         // The sounds are built in: every one synthesises and has a length.
         let lengths = SoundBox().durations()
-        check(lengths.count == 5 && lengths.allSatisfy { $0 > 0.1 },
-              "all five sounds are synthesised in the app (\(lengths.map { String(format: "%.2fs", $0) }.joined(separator: ", ")))")
+        check(lengths.count == 6 && lengths.allSatisfy { $0 > 0.1 },
+              "all six sounds are synthesised in the app (\(lengths.map { String(format: "%.2fs", $0) }.joined(separator: ", ")))")
+    }
+}
+
+extension SelfTest {
+    /// Shared cardboard boxes: any cat, any box, up to a million.
+    static func boxChecks(_ check: (Bool, String) -> Void) {
+        let scr = ScreenInfo(frame: CGRect(x: 0, y: 0, width: 1440, height: 900),
+                             visible: CGRect(x: 0, y: 60, width: 1440, height: 815))
+        func world(_ cursor: CGPoint) -> World { World(screens: [scr], windows: [], cursor: cursor) }
+        func cat(_ id: Int, at p: CGPoint, pile: ToyPile) -> Playground {
+            var c = Playground(position: p)
+            c.cat.random = { _ in 1 }; c.random = { _ in 0 }
+            c.spotWindows = false; c.spotMenuBar = false; c.spotDock = false
+            c.toys = pile
+            c.catID = id
+            c.ownsToys = id == 0
+            return c
+        }
+
+        // Two cats, two boxes: each naps in its own, and the second never squeezes into the first's.
+        let pile = ToyPile()
+        var a = cat(0, at: CGPoint(x: 300, y: 300), pile: pile)
+        var b = cat(1, at: CGPoint(x: 900, y: 300), pile: pile)
+        a.placeBox(at: CGPoint(x: 400, y: 75), falling: false, index: 0)
+        a.placeBox(at: CGPoint(x: 1000, y: 75), falling: false, index: 1)
+        for _ in 0..<400 where !(a.inBox && b.inBox) {
+            a.tick10(world: world(CGPoint(x: 300, y: 300)))
+            b.tick10(world: world(CGPoint(x: 900, y: 300)))
+        }
+        check(a.inBox && b.inBox && a.boxIndex != b.boxIndex, "two cats nap in two boxes, one each (\(String(describing: a.boxIndex)), \(String(describing: b.boxIndex)))")
+        check(pile.boxes.allSatisfy { $0.napper != nil }, "...and the pile knows who's in which")
+
+        // One box, two cats: the second cat to want it doesn't get in.
+        let one = ToyPile()
+        var c = cat(0, at: CGPoint(x: 300, y: 75), pile: one)
+        var d = cat(1, at: CGPoint(x: 300, y: 75), pile: one)
+        c.placeBox(at: CGPoint(x: 300, y: 75), falling: false)
+        for _ in 0..<400 where !c.inBox { c.tick10(world: world(CGPoint(x: 300, y: 75))) }
+        for _ in 0..<400 { d.tick10(world: world(CGPoint(x: 300, y: 75))) }
+        check(c.inBox && !d.inBox, "a box with a cat in it is taken: the other cat finds somewhere else")
+        check(d.chooseSpot(world(.zero)).map { !$0.kind.isBox } ?? true, "...it isn't even a nap spot for it")
+        // The extra (not the box owner) dropped over a free box lands in it.
+        let drop = ToyPile()
+        var owner = cat(0, at: CGPoint(x: 100, y: 500), pile: drop)
+        var extra = cat(5, at: CGPoint(x: 700, y: 400), pile: drop)
+        owner.placeBox(at: CGPoint(x: 700, y: 75), falling: false)
+        extra.mouseDown(on: .cat, at: CGPoint(x: 700, y: 400), time: 0)
+        extra.mouseDragged(to: CGPoint(x: 700, y: 406), time: 0.01)
+        extra.mouseUp(at: CGPoint(x: 700, y: 406), time: 0.5)
+        for _ in 0..<240 where !extra.inBox { extra.physics(dt: 1.0 / 60, world: world(.zero)) }
+        check(extra.inBox && drop.boxes[0].napper == 5, "any cat dropped over a box lands in it, not just the first")
+        // Carrying the box carries whichever cat is inside.
+        owner.mouseDown(on: .box, at: CGPoint(x: 700, y: 75), time: 1)
+        owner.mouseDragged(to: CGPoint(x: 800, y: 300), time: 1.05)
+        extra.physics(dt: 1.0 / 60, world: world(.zero))
+        check(extra.needsPhysics && extra.cat.position == drop.boxes[0].prop.body.pos, "...and carrying that box carries it along")
+        owner.mouseUp(at: CGPoint(x: 800, y: 300), time: 1.5)
+        // Shutting it from the box (the owner's side) and opening it again lets the cat out.
+        extra.mouseUp(at: .zero, time: 2)
+        for _ in 0..<240 { owner.physics(dt: 1.0 / 60, world: world(.zero)); extra.physics(dt: 1.0 / 60, world: world(.zero)) }
+        owner.rightClick(.box, index: 0)
+        for _ in 0..<1300 where extra.catPose.rattle == 0 { extra.tick10(world: world(.zero)) }
+        check(extra.inBox && extra.catPose.boxClosed && extra.catPose.rattle != 0, "shut a box with any cat inside: it rattles to get out")
+        owner.rightClick(.box, index: 0)
+        extra.tick10(world: world(.zero))
+        check(!extra.inBox && extra.mode == .flying, "...and pops out when you open it")
+        // Fewer boxes: a cat napping in one that's gone wakes up.
+        let few = ToyPile()
+        var e = cat(0, at: CGPoint(x: 300, y: 75), pile: few)
+        var f = cat(1, at: CGPoint(x: 900, y: 75), pile: few)
+        e.placeBox(at: CGPoint(x: 300, y: 75), falling: false, index: 0)
+        e.placeBox(at: CGPoint(x: 900, y: 75), falling: false, index: 1)
+        for _ in 0..<400 where !e.inBox { e.tick10(world: world(CGPoint(x: 300, y: 75))) }
+        for _ in 0..<400 where !f.inBox { f.tick10(world: world(CGPoint(x: 900, y: 75))) }
+        check(f.boxIndex == 1, "with the first box taken, the next cat naps in the other one")
+        e.removeBoxes(keeping: 1)
+        f.tick10(world: world(CGPoint(x: 900, y: 75)))
+        check(few.boxes.count == 1 && !f.inBox, "taking boxes away wakes the cats napping in them")
+
+        // The heap: past 50, boxes pile up in the corner, drawn by the GPU.
+        let screens = [CGRect(x: 0, y: 0, width: 1440, height: 900), CGRect(x: 1440, y: 0, width: 1920, height: 1080)]
+        let small = BoxHeap.layout(count: 10, screens: [screens[0]], scale: 1)
+        check(small.count == 10 && small.allSatisfy { $0.x > 1100 && $0.y < 130 }, "a small heap sits in the bottom-right corner")
+        check(Set(small.map { "\($0.x),\($0.y)" }).count == 10, "...with no two boxes in the same spot")
+        let big = BoxHeap.layout(count: 1_000_000, screens: screens, scale: 2)
+        let inside = big.allSatisfy { p in screens.contains { $0.insetBy(dx: -1, dy: -1).contains(CGPoint(x: CGFloat(p.x), y: CGFloat(p.y))) } }
+        check(big.count == 1_000_000 && inside, "a million boxes fit, every one on a display")
+        check(big.map(\.y).max()! < 1080 * 0.75, "...piled no higher than about half the display")
+        let heapFrame = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        if let px = BoxHeap().snapshot(BoxHeap.layout(count: 200, screens: [heapFrame], scale: 1), scale: 1, frame: heapFrame) {
+            // Rows top-first: the heap is in the bottom-right, so paint is there and not top-left.
+            func painted(_ x0: Int, _ y0: Int, _ x1: Int, _ y1: Int) -> Int {
+                var n = 0
+                for y in y0..<y1 { for x in x0..<x1 where px[(y * 1440 + x) * 4 + 3] > 0 { n += 1 } }
+                return n
+            }
+            let corner = painted(1000, 600, 1440, 900), elsewhere = painted(0, 0, 700, 500)
+            check(corner > 20_000 && elsewhere == 0, "the heap's GPU code draws it in the bottom-right corner (\(corner) px)")
+        } else {
+            check(false, "the box heap's GPU code compiles")
+        }
+        var g = cat(0, at: CGPoint(x: 1300, y: 300), pile: ToyPile())
+        g.toys.heap = BoxHeap.layout(count: 30, screens: [screens[0]], scale: 1)
+        var heapNap = false
+        for _ in 0..<2000 where !heapNap { g.tick10(world: world(CGPoint(x: 1300, y: 300))); heapNap = g.heapIndex != nil }
+        check(heapNap && g.catPose.inBox, "a cat naps in a box on the heap, too")
+        g.toys.heap = []
+        g.tick10(world: world(.zero))
+        check(!g.inBox, "...and wakes when the heap is put away")
+
+        // Settings: a count up to a million; old single-box settings carry over.
+        let suite = "local.oneko.selftest.boxes"
+        UserDefaults().removePersistentDomain(forName: suite)
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.set(true, forKey: "boxOut")
+        defaults.set(120.0, forKey: "boxX"); defaults.set(80.0, forKey: "boxY")
+        let s = Settings(defaults: defaults)
+        check(s.boxCount == 1 && s.boxPositions == [CGPoint(x: 120, y: 80)], "an old box (0.5.5) carries over as 1 box, where it was")
+        check(s.dockBonk, "the Dock bonk is on by default")
+        s.boxCount = 5_000_000
+        check(s.boxCount == 1_000_000 && s.realBoxCount == 50 && s.heapBoxCount == 999_950, "boxes go up to 1,000,000: 50 real, the rest the heap")
+        s.boxCount = 0
+        check(!s.boxOut && s.lastBoxCount == 1_000_000, "turning boxes off remembers how many there were")
+        // What's New: once per update, never on a fresh install (that gets How to Play).
+        let fresh = Settings(defaults: defaults)
+        defaults.removeObject(forKey: "seenWelcome"); defaults.removeObject(forKey: "lastSeenVersion")
+        check(!fresh.shouldShowWhatsNew(current: "0.5.7"), "a fresh install doesn't get What's New")
+        fresh.seenWelcome = true
+        check(fresh.shouldShowWhatsNew(current: "0.5.7"), "updating from 0.5.5 shows What's New")
+        fresh.lastSeenVersion = "0.5.7"
+        check(!fresh.shouldShowWhatsNew(current: "0.5.7") && fresh.shouldShowWhatsNew(current: "0.5.8"),
+              "...once per version")
+        check(WhatsNewWindow.releases.first?.version == Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+              || Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") == nil,
+              "What's New has notes for this version")
+        UserDefaults().removePersistentDomain(forName: suite)
+    }
+}
+
+extension SelfTest {
+    /// Bones, yarn and the laser for every cat.
+    static func sharedToyChecks(_ check: (Bool, String) -> Void) {
+        let scr = ScreenInfo(frame: CGRect(x: 0, y: 0, width: 1440, height: 900),
+                             visible: CGRect(x: 0, y: 60, width: 1440, height: 815))
+        func world(_ cursor: CGPoint, pointer: CGPoint? = nil) -> World {
+            var w = World(screens: [scr], windows: [], cursor: cursor)
+            w.pointer = pointer
+            return w
+        }
+        func cat(_ id: Int, at p: CGPoint, pile: ToyPile) -> Playground {
+            var c = Playground(position: p)
+            c.cat.random = { _ in 1 }; c.random = { _ in 0 }
+            c.spotWindows = false; c.spotMenuBar = false; c.spotDock = false
+            c.cat.sleepEnabled = false
+            c.toys = pile
+            c.catID = id
+            c.ownsToys = id == 0
+            return c
+        }
+
+        // A bone tossed near the second cat: that cat fetches it, not the first.
+        let pile = ToyPile()
+        var a = cat(0, at: CGPoint(x: 200, y: 300), pile: pile)
+        var b = cat(1, at: CGPoint(x: 1200, y: 300), pile: pile)
+        a.placeBone(at: CGPoint(x: 1150, y: 64), falling: false)
+        a.mouseDown(on: .bone, at: CGPoint(x: 1150, y: 64), time: 0)
+        a.mouseUp(at: CGPoint(x: 1150, y: 64), time: 0.05)              // a click: a little toss
+        for _ in 0..<3 {
+            a.tick10(world: world(CGPoint(x: 200, y: 300))); b.tick10(world: world(CGPoint(x: 1200, y: 300)))
+            for _ in 0..<6 { a.physics(dt: 1.0 / 60, world: world(.zero)) }
+        }
+        check(b.mode == .fetching && a.mode != .fetching, "the closest cat goes for a tossed bone (not just the first cat)")
+        var fetched = false
+        for _ in 0..<300 where !fetched {
+            a.tick10(world: world(CGPoint(x: 200, y: 300)))
+            b.tick10(world: world(CGPoint(x: 1200, y: 300), pointer: CGPoint(x: 700, y: 400)))
+            for _ in 0..<6 { a.physics(dt: 1.0 / 60, world: world(.zero)) }
+            fetched = b.drainEvents().contains(.fetched)
+        }
+        check(fetched && hypot(b.cat.position.x - 700, b.cat.position.y - 400) < 60,
+              "...and brings it back to you (your cursor, not its spot in the swarm)")
+        check(pile.bones[0].fetcher == nil && !pile.bones[0].wanted, "...and lets go of it")
+
+        // A closer cat takes over on the way.
+        let race = ToyPile()
+        var far = cat(0, at: CGPoint(x: 100, y: 300), pile: race)
+        var near = cat(1, at: CGPoint(x: 1300, y: 600), pile: race)
+        far.placeBone(at: CGPoint(x: 700, y: 64), falling: false)
+        race.bones[0].wanted = true
+        far.tick10(world: world(CGPoint(x: 100, y: 300)))
+        check(far.mode == .fetching, "the only cat near enough goes for the bone")
+        near.cat.position = CGPoint(x: 720, y: 120)
+        near.tick10(world: world(CGPoint(x: 720, y: 120)))
+        far.tick10(world: world(CGPoint(x: 100, y: 300)))
+        check(near.mode == .fetching && far.mode != .fetching, "...but a much closer cat takes over, and the first gives up")
+
+        // Two bones, two cats: one each.
+        let two = ToyPile()
+        var c = cat(0, at: CGPoint(x: 300, y: 300), pile: two)
+        var d = cat(1, at: CGPoint(x: 1100, y: 300), pile: two)
+        c.placeBone(at: CGPoint(x: 350, y: 64), falling: false, index: 0)
+        c.placeBone(at: CGPoint(x: 1050, y: 64), falling: false, index: 1)
+        two.bones[0].wanted = true; two.bones[1].wanted = true
+        c.tick10(world: world(CGPoint(x: 300, y: 300))); d.tick10(world: world(CGPoint(x: 1100, y: 300)))
+        check(c.boneIndex == 0 && d.boneIndex == 1 && c.mode == .fetching && d.mode == .fetching, "two bones, two cats: each fetches the one nearest it")
+
+        // Yarn: an extra cat chases a ball rolling past it, and bats one it's sitting next to.
+        let yarnPile = ToyPile()
+        var owner = cat(0, at: CGPoint(x: 100, y: 800), pile: yarnPile)
+        var e = cat(3, at: CGPoint(x: 900, y: 80), pile: yarnPile)
+        owner.placeYarn(at: CGPoint(x: 700, y: 66), falling: false)
+        yarnPile.yarns[0].prop.state = .flying
+        yarnPile.yarns[0].prop.body.vel = CGVector(dx: 600, dy: 0)
+        e.tick10(world: world(CGPoint(x: 900, y: 80)))
+        check({ if case .chasingYarn = e.mode { return true }; return false }(), "any cat chases a rolling ball of yarn")
+        var batted = false
+        for _ in 0..<80 where !batted {
+            e.tick10(world: world(CGPoint(x: 900, y: 80)))
+            for _ in 0..<6 { owner.physics(dt: 1.0 / 60, world: world(.zero)) }
+            batted = e.drainEvents().contains(.batYarn)
+        }
+        check(batted, "...and bats it")
+        // Only the owner moves the toys: the extra's physics leaves a flying ball alone.
+        let before = yarnPile.yarns[0].prop.body
+        e.physics(dt: 1.0 / 60, world: world(.zero))
+        check(yarnPile.yarns[0].prop.body == before, "only one cat's playground moves the toys (no double-speed toys)")
+
+        // Laser: extras chase it too (they get the dot as their target).
+        var l = cat(4, at: CGPoint(x: 300, y: 300), pile: ToyPile())
+        l.laser = true
+        for _ in 0..<40 { l.tick10(world: world(CGPoint(x: 800, y: 500))) }
+        check(hypot(l.cat.position.x - 800, l.cat.position.y - 500) < 60, "an extra cat dashes after the laser dot")
+
+        // Food: a hungry cat walks to the bowl, eats, and the bowl empties meal by meal.
+        let fp = ToyPile()
+        var eater = cat(0, at: CGPoint(x: 300, y: 400), pile: fp)
+        eater.placeBowl(at: CGPoint(x: 900, y: 63.5), falling: false)
+        eater.makeHungry()
+        var ate = false, wentToBowl = false
+        for _ in 0..<300 where !ate {
+            eater.tick10(world: world(CGPoint(x: 300, y: 400)))
+            if case .goingToBowl = eater.mode { wentToBowl = true }
+            ate = eater.drainEvents().contains(.ate)
+        }
+        check(wentToBowl && ate && !eater.isHungry, "a hungry cat goes to the food bowl and eats")
+        check(fp.bowls[0].food == ToyPile.Bowl.full - 1, "...one meal out of the bowl")
+        check(abs(eater.cat.position.x - 900) < 30, "...eating right beside it")
+        fp.bowls[0].food = 0
+        var picky = cat(1, at: CGPoint(x: 300, y: 400), pile: fp)
+        picky.makeHungry()
+        for _ in 0..<50 { picky.tick10(world: world(CGPoint(x: 300, y: 400))) }
+        check({ if case .goingToBowl = picky.mode { return false }; if case .eating = picky.mode { return false }; return true }(),
+              "an empty bowl: nothing to eat")
+        eater.mouseDown(on: .bowl, at: CGPoint(x: 900, y: 63.5), time: 0)
+        eater.mouseUp(at: CGPoint(x: 900, y: 63.5), time: 0.05)
+        check(fp.bowls[0].food == ToyPile.Bowl.full, "click the bowl to fill it up")
+
+        // Playing together: the matcher pairs neighbours only, each cat once.
+        let spots = [CGPoint(x: 100, y: 100), CGPoint(x: 130, y: 100), CGPoint(x: 900, y: 100), CGPoint(x: 120, y: 120),
+                     CGPoint(x: 905, y: 110), CGPoint(x: 2000, y: 100)]
+        let pairs = PlayMatcher.pairs(spots, free: [true, true, true, true, true, true], radius: 50, chance: { _ in 0 })
+        let used = pairs.flatMap { [$0.0, $0.1] }
+        check(pairs.count == 2 && Set(used).count == 4 && !used.contains(5)
+              && pairs.allSatisfy { hypot(spots[$0.0].x - spots[$0.1].x, spots[$0.0].y - spots[$0.1].y) < 50 },
+              "cats sitting together pair up to play (neighbours only, one partner each)")
+        check(PlayMatcher.pairs(spots, free: [false, true, false, false, true, true], radius: 50, chance: { _ in 0 }).isEmpty,
+              "...but not cats that are busy")
+        let many = (0..<20_000).map { CGPoint(x: CGFloat($0 % 400) * 9, y: CGFloat($0 / 400) * 9) }
+        let ms = (0..<3).map { _ -> Double in   // best of 3, so a busy Mac doesn't fail it
+            let t0 = Date()
+            _ = PlayMatcher.pairs(many, free: many.map { _ in true }, radius: 50, chance: { _ in 1 })
+            return Date().timeIntervalSince(t0) * 1000
+        }.min()!
+        check(ms < 100, "...and finding pairs among 20,000 cats is quick (\(Int(ms)) ms)")
+        for kind in PlayKind.allCases {
+            let pp = ToyPile()
+            var x = cat(0, at: CGPoint(x: 600, y: 300), pile: pp)
+            var y = cat(1, at: CGPoint(x: 630, y: 300), pile: pp)
+            for _ in 0..<30 { x.tick10(world: world(CGPoint(x: 600, y: 300))); y.tick10(world: world(CGPoint(x: 630, y: 300))) }
+            check(x.canPlay && y.canPlay, "idle cats are free to play (\(kind))")
+            x.startPlay(kind, with: y.cat.position, leader: true)
+            y.startPlay(kind, with: x.cat.position, leader: false)
+            var hearts = 0, anger = false, apart: CGFloat = 0
+            for _ in 0..<kind.ticks + 2 {
+                x.partner = y.cat.position; y.partner = x.cat.position
+                x.tick10(world: world(CGPoint(x: 600, y: 300))); y.tick10(world: world(CGPoint(x: 630, y: 300)))
+                hearts += x.drainEvents().filter { $0 == .heart }.count
+                anger = anger || x.catPose.angry
+                apart = max(apart, hypot(x.cat.position.x - 600, x.cat.position.y - 300))
+            }
+            switch kind {
+            case .groom: check(hearts >= 2, "grooming each other: hearts")
+            case .fight: check(anger && { if case .dazed = x.mode { return true }; return false }(), "a play-fight: 💢, then they sit it off")
+            case .chase: check(apart > 60 && hypot(x.cat.position.x - y.cat.position.x, x.cat.position.y - y.cat.position.y) < 400,
+                               "a chase: one runs off, the other follows")
+            }
+            check(!x.isPlaying && !y.isPlaying, "...and then it's over (\(kind))")
+        }
+
+        // Stacking: a box dropped on a box lands on its rim; take the bottom one and it falls.
+        let sp = ToyPile()
+        var stacker = cat(0, at: CGPoint(x: 100, y: 700), pile: sp)
+        stacker.placeBox(at: CGPoint(x: 700, y: 60 + 15), falling: false, index: 0)
+        stacker.placeBox(at: CGPoint(x: 704, y: 300), falling: true, index: 1)
+        for _ in 0..<240 where !sp.boxes[1].prop.isResting { stacker.physics(dt: 1.0 / 60, world: world(.zero)) }
+        let topY = sp.boxes[1].prop.body.pos.y
+        check(sp.boxes[1].prop.isResting && topY > 75 + 15, "a box dropped on another stacks on top of it (y=\(Int(topY)))")
+        stacker.placeBone(at: CGPoint(x: 700, y: 400), falling: true)
+        for _ in 0..<240 where !sp.bones[0].prop.isResting { stacker.physics(dt: 1.0 / 60, world: world(.zero)) }
+        check(sp.bones[0].prop.body.pos.y > topY, "...and a bone dropped on the stack lands on top")
+        stacker.mouseDown(on: .box, at: CGPoint(x: 700, y: 75), time: 0, index: 0)
+        stacker.mouseDragged(to: CGPoint(x: 400, y: 300), time: 0.1)
+        stacker.physics(dt: 1.0 / 60, world: world(.zero))
+        check(sp.boxes[1].prop.state == .flying, "pull the bottom box out and the one on top falls")
+        stacker.mouseUp(at: CGPoint(x: 400, y: 300), time: 1)
+        check(!stacker.needsWindowTracking || sp.boxes.contains { $0.prop.state == .flying },
+              "boxes sitting on boxes don't keep window reading going")
+        // Climbing: in gravity mode a cat hops up onto a box to get to a cursor above it.
+        let cp = ToyPile()
+        var climber = cat(0, at: CGPoint(x: 500, y: 73), pile: cp)
+        climber.placeBox(at: CGPoint(x: 600, y: 60 + 15), falling: false)
+        climber.gravityMode = true
+        climber.cat.sleepEnabled = false
+        var maxFeet: CGFloat = 0
+        for _ in 0..<60 {
+            climber.tick10(world: world(CGPoint(x: 600, y: 400)))
+            for _ in 0..<6 { climber.physics(dt: 1.0 / 60, world: world(CGPoint(x: 600, y: 400))) }
+            maxFeet = max(maxFeet, climber.cat.position.y - 13)
+        }
+        check(climber.cat.position.y - 13 > 75 + 4 && abs(climber.cat.position.x - 600) < 20,
+              "a walking cat hops up onto a box to get closer to you (feet at \(Int(climber.cat.position.y - 13)))")
+
+        // The big box: four cats in one box, each in its own seat.
+        let bp = ToyPile()
+        var bigCats = (0..<5).map { cat($0, at: CGPoint(x: 400 + CGFloat($0) * 10, y: 500), pile: bp) }
+        bigCats[0].placeBox(at: CGPoint(x: 500, y: 60 + 31), falling: false)
+        bp.setBig(0, true)
+        for _ in 0..<120 { bigCats[0].physics(dt: 1.0 / 60, world: world(.zero)) }
+        check(bp.boxes[0].prop.isResting && bp.boxes[0].prop.shape.halfW == 28, "a big box is twice the size")
+        for i in bigCats.indices {
+            bigCats[i].launch(at: CGPoint(x: 500 + CGFloat(i * 4 - 8), y: 200), velocity: .zero)
+            for _ in 0..<120 where !bigCats[i].inBox { bigCats[i].physics(dt: 1.0 / 60, world: world(.zero)) }
+        }
+        let inside = bigCats.filter(\.inBigBox)
+        check(inside.count == 4 && bp.boxes[0].nappers.count == 4, "four cats fit in the big box (the fifth doesn't)")
+        check(Set(inside.map { "\($0.cat.position.x)" }).count == 4, "...each in its own seat")
+        check(inside.allSatisfy { !$0.catPose.inBox && $0.catPose.inBigBox }, "...drawn by the big box, not their own little box")
+        bigCats[0].rightClick(.box, index: 0)
+        check(!bp.boxes[0].closed, "a big box has no flaps to shut")
+        // ...and they nap there until you take them out: long past a nap's end, still in.
+        let seated = bigCats.indices.filter { bigCats[$0].inBigBox }
+        for _ in 0..<1500 { for i in seated { bigCats[i].tick10(world: world(CGPoint(x: 1200, y: 600))) } }
+        check(seated.allSatisfy { bigCats[$0].inBigBox && bigCats[$0].isSleeping },
+              "cats in the big box nap on until you take them out")
+        let lifted = seated[0], napper = seated[1]
+        let head = bigCats[lifted].cat.position
+        bigCats[lifted].mouseDown(on: .cat, at: head, time: 0)
+        bigCats[lifted].mouseDragged(to: CGPoint(x: head.x + 40, y: head.y + 200), time: 0.1)
+        bigCats[lifted].mouseUp(at: CGPoint(x: head.x + 40, y: head.y + 200), time: 0.6)
+        bigCats[lifted].tick10(world: world(CGPoint(x: 1200, y: 600)))
+        check(!bigCats[lifted].inBigBox && bp.boxes[0].nappers.count == 3, "...you lift one out by dragging it")
+        bigCats[napper].mouseDown(on: .cat, at: bigCats[napper].cat.position, time: 1)
+        bigCats[napper].mouseUp(at: bigCats[napper].cat.position, time: 1.05, clickCount: 2)
+        bigCats[napper].tick10(world: world(CGPoint(x: 1200, y: 600)))
+        check(!bigCats[napper].inBigBox, "...or double-click one awake and out it climbs")
+
+        // Crowd cats nap in the GPU box heap (real GPU code).
+        let crowd = CrowdController()
+        if crowd.isAvailable, let sheet = SpriteSheet.load() {
+            let screen = CGRect(x: 0, y: 0, width: 1440, height: 900)
+            crowd.setHeap(BoxHeap.layout(count: 400, screens: [screen], scale: 1))
+            _ = crowd.selfCheck(count: 600, sheets: [sheet], ticks: 400, cursor: CGPoint(x: 400, y: 500), screen: screen)
+            let napping = crowd.heapNappers()
+            check(napping > 50, "crowd cats go and nap in the box heap (\(napping) of 600)")
+        } else {
+            check(false, "crowd mode's GPU code compiles (with the heap)")
+        }
+
+        // Names: the first cat is Neko, the rest have their own names, and renaming sticks.
+        check(CatNames.name(0) == "Neko" && CatNames.name(1) == "Mochi" && CatNames.name(2) != CatNames.name(1),
+              "every cat has a name (Neko, Mochi, …)")
+        check(CatNames.name(CatNames.names.count + 1) == "Mochi II", "...and past the list they get numbered (Mochi II)")
+        check(CatNames.name(0, custom: ["0": "Biscuit"]) == "Biscuit", "...and you can rename them")
+        let csSuite = "local.oneko.selftest.catstats"
+        UserDefaults().removePersistentDomain(forName: csSuite)
+        let cs = CatStats(defaults: UserDefaults(suiteName: csSuite)!)
+        for _ in 0..<3 { cs.bump(.pets, cat: 2) }
+        cs.bump(.yeets, cat: 2); cs.bump(.pets, cat: 0)
+        check(cs.summary(cat: 2) == "3 pets · 1 yeets", "each cat keeps its own stats (\(cs.summary(cat: 2)))")
+        check(cs.champion(.pets, among: 5)?.id == 2 && cs.champion(.pets, among: 2)?.id == 0, "...with a leaderboard of the cats you have")
+        cs.save()
+        check(CatStats(defaults: UserDefaults(suiteName: csSuite)!).value(.pets, cat: 2) == 3, "...that survives a relaunch")
+        UserDefaults().removePersistentDomain(forName: csSuite)
+
+        // Weather: by the season, or your real weather.
+        func day(_ m: Int) -> Date { Calendar.current.date(from: DateComponents(year: 2026, month: m, day: 10))! }
+        check(SeasonOverlay.weather("auto", date: day(12)) == .snow && SeasonOverlay.weather("auto", date: day(10)) == .leaves
+              && SeasonOverlay.weather("auto", date: day(6)) == nil && SeasonOverlay.weather("off", date: day(12)) == nil,
+              "seasonal weather: snow in winter, leaves in autumn, nothing in summer")
+        check(LiveWeather.weather(code: 95, isDay: true) == .thunder && LiveWeather.weather(code: 63, isDay: false) == .rain
+              && LiveWeather.weather(code: 81, isDay: true) == .rain && LiveWeather.weather(code: 73, isDay: true) == .snow
+              && LiveWeather.weather(code: 0, isDay: true) == .sunny && LiveWeather.weather(code: 0, isDay: false) == nil
+              && LiveWeather.weather(code: 3, isDay: true) == nil,
+              "local weather: thunderstorms, rain and snow fall, clear days shine, clouds and clear nights are calm")
+        check(SeasonOverlay.weather("live", live: .rain) == .rain && SeasonOverlay.weather("live", live: nil) == nil
+              && SeasonOverlay.weather("thunder") == .thunder && SeasonOverlay.weather("sunny") == .sunny,
+              "the weather setting: local, or one you pick")
+
+        // Updates: version numbers compared properly, GitHub's release read right.
+        check(UpdateChecker.isNewer("v0.5.10", than: "0.5.9") && UpdateChecker.isNewer("0.6", than: "0.5.9")
+              && !UpdateChecker.isNewer("0.5.8", than: "0.5.8") && !UpdateChecker.isNewer("v0.5.7", than: "0.5.8"),
+              "update check: 0.5.10 is newer than 0.5.9, the same version isn't")
+        let json = #"{"tag_name":"v0.5.9","html_url":"https://github.com/rsinghSD/oneko/releases/tag/v0.5.9","body":"cat follow mouse (real)","assets":[{"browser_download_url":"https://github.com/rsinghSD/oneko/releases/download/v0.5.9/Oneko-0.5.9.dmg"}]}"#
+        let rel = UpdateChecker.parse(Data(json.utf8))
+        check(rel?.version == "0.5.9" && rel?.dmg?.lastPathComponent == "Oneko-0.5.9.dmg", "...and reads GitHub's latest release (the DMG to download)")
+
+        // Settings: counts up to 50, old toggles carry over.
+        let suite = "local.oneko.selftest.toys"
+        UserDefaults().removePersistentDomain(forName: suite)
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.set(true, forKey: "boneOut"); defaults.set(true, forKey: "yarnOut")
+        defaults.set(10.0, forKey: "boneX"); defaults.set(20.0, forKey: "boneY")
+        let st = Settings(defaults: defaults)
+        check(st.boneCount == 1 && st.yarnCount == 1 && st.bonePositions == [CGPoint(x: 10, y: 20)],
+              "an old bone and ball of yarn carry over as 1 each")
+        st.boneCount = 500; st.yarnCount = 7
+        check(st.boneCount == 50 && st.yarnCount == 7, "bones and yarn go up to 50 each")
+        st.boneCount = 0
+        check(!st.boneOut && st.lastBoneCount == 50, "turning bones off remembers how many")
+        UserDefaults().removePersistentDomain(forName: suite)
     }
 }

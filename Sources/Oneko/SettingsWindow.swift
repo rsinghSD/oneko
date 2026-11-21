@@ -123,6 +123,33 @@ class SettingsPage: NSViewController {
         return p
     }
 
+    /// A number field (0…max) with thousands separators.
+    func countField(max: Int, _ action: Selector) -> NSTextField {
+        let f = NumberFormatter()
+        f.numberStyle = .decimal
+        f.allowsFloats = false
+        f.minimum = 0
+        f.maximum = NSNumber(value: max)
+        let t = NSTextField()
+        t.formatter = f
+        t.alignment = .right
+        t.target = self
+        t.action = action
+        t.widthAnchor.constraint(equalToConstant: 90).isActive = true
+        return t
+    }
+
+    func stepper(max: Int, _ action: Selector) -> NSStepper {
+        let s = NSStepper()
+        s.minValue = 0
+        s.maxValue = Double(max)
+        s.increment = 1
+        s.valueWraps = false
+        s.target = self
+        s.action = action
+        return s
+    }
+
     func button(_ title: String, _ action: Selector) -> NSButton {
         let b = NSButton(title: title, target: self, action: action)
         b.bezelStyle = .rounded
@@ -145,7 +172,19 @@ final class GeneralPage: SettingsPage {
     private lazy var coat = popup([], #selector(coatChanged))
     private lazy var hat = popup(["Seasonal", "None", "Santa Hat", "Witch Hat", "Party Hat"], #selector(hatChanged))
     private lazy var paused = checkbox("Paused (curls up and sleeps)", #selector(pauseChanged))
+    private lazy var weather = popup(["Your local weather (rain, thunder, sun, snow)", "Seasonal (snow in winter, leaves in autumn)",
+                                      "Off", "Snow", "Falling Leaves", "Rain", "Thunderstorm", "Sunny"], #selector(weatherChanged))
+    private static let weatherKeys = ["live", "auto", "off", "snow", "leaves", "rain", "thunder", "sunny"]
+    private lazy var name: NSTextField = {
+        let t = NSTextField()
+        t.placeholderString = "Neko"
+        t.target = self
+        t.action = #selector(nameChanged)
+        t.widthAnchor.constraint(equalToConstant: 160).isActive = true
+        return t
+    }()
     private lazy var login = checkbox("Launch Oneko at login", #selector(loginChanged))
+    private lazy var autoUpdate = checkbox("Check for updates once a day", #selector(autoUpdateChanged))
     private static let hatKeys = ["auto", "none", "santa", "witch", "party"]
 
     override init(nibName: NSNib.Name?, bundle: Bundle?) {
@@ -161,9 +200,15 @@ final class GeneralPage: SettingsPage {
         gap()
         row("Coat", coat, button("Paint Your Coat…", #selector(paintCoat)))
         row("Hat", hat)
+        row("Name", name)
+        note("Hover over any cat to see its name and its stats. ⌥-click any cat to rename it.")
+        row("Weather", weather)
+        note("Local weather looks up your rough location from your IP address (ipwho.is) and the weather there (Open-Meteo), every 30 minutes.")
         gap()
         row("", paused)
         row("", login)
+        row("", autoUpdate, button("Check Now", #selector(checkNow)))
+        note("Asks GitHub for the newest Oneko release. Nothing about you is sent.")
     }
 
     override func refresh() {
@@ -175,7 +220,10 @@ final class GeneralPage: SettingsPage {
         else if s.skin == Skin.paintedID { coat.selectItem(at: Skin.all.count) }
         else { coat.selectItem(at: Skin.all.count + 1) }
         hat.selectItem(at: Self.hatKeys.firstIndex(of: s.hat) ?? 0)
+        weather.selectItem(at: Self.weatherKeys.firstIndex(of: s.weather) ?? 0)
+        if name.currentEditor() == nil { name.stringValue = s.catNames["0"] ?? "" }
         paused.state = s.paused ? .on : .off
+        autoUpdate.state = s.autoUpdateCheck ? .on : .off
         let status = SMAppService.mainApp.status
         login.state = status == .enabled ? .on : .off
         login.title = status == .requiresApproval ? "Launch Oneko at login (needs approval in System Settings)"
@@ -203,7 +251,20 @@ final class GeneralPage: SettingsPage {
     @objc private func hatChanged() {
         changed { app?.settings.hat = Self.hatKeys[hat.indexOfSelectedItem]; app?.applyHat() }
     }
+    @objc private func weatherChanged() {
+        changed { app?.settings.weather = Self.weatherKeys[weather.indexOfSelectedItem]; app?.updateSeason() }
+    }
+    @objc private func nameChanged() {
+        changed {
+            var names = app?.settings.catNames ?? [:]
+            let n = name.stringValue.trimmingCharacters(in: .whitespaces)
+            names["0"] = n.isEmpty ? nil : n
+            app?.settings.catNames = names
+        }
+    }
     @objc private func pauseChanged() { changed { app?.togglePause() } }
+    @objc private func autoUpdateChanged() { changed { app?.settings.autoUpdateCheck.toggle() } }
+    @objc private func checkNow() { app?.checkForUpdates() }
     @objc private func loginChanged() { changed { app?.toggleLaunchAtLogin() } }
 }
 
@@ -238,6 +299,7 @@ final class CatsPage: SettingsPage {
         return s
     }()
     private lazy var crowd = checkbox("Crowd mode: cats past 50 are light GPU cats", #selector(crowdChanged))
+    private lazy var plays = checkbox("Cats play with each other", #selector(playsChanged))
     private lazy var behavior = popup(Settings.CatBehavior.allCases.map(\.title), #selector(behaviorChanged))
     private lazy var coats = popup(Settings.CoatMode.allCases.map(\.title), #selector(coatsChanged))
     private lazy var choose = button("Choose…", #selector(chooseCoats))
@@ -261,6 +323,8 @@ final class CatsPage: SettingsPage {
         warningRow = grid.addRow(with: [NSGridCell.emptyContentView, warning])
         gap()
         row("Extra cats", behavior)
+        row("", plays)
+        note("Cats sitting next to each other now and then groom each other, have a play-fight, or chase each other around.")
         row("Coats", coats, choose)
         if TouchBarCat.isSupported { note("The Touch Bar shows up to 50 cats.") }
     }
@@ -274,6 +338,7 @@ final class CatsPage: SettingsPage {
         if count.currentEditor() == nil { count.integerValue = n }
         stepper.integerValue = n
         crowd.state = s.crowdMode ? .on : .off
+        plays.state = s.catsPlay ? .on : .off
         behavior.selectItem(at: Settings.CatBehavior.allCases.firstIndex(of: s.catBehavior) ?? 0)
         coats.selectItem(at: Settings.CoatMode.allCases.firstIndex(of: s.coatMode) ?? 0)
         choose.isEnabled = s.coatMode == .custom && n >= 2
@@ -317,6 +382,8 @@ final class CatsPage: SettingsPage {
             app.setCatCount(app.settings.catCount)
         }
     }
+    @objc private func playsChanged() { changed { app?.settings.catsPlay.toggle() } }
+
     @objc private func behaviorChanged() {
         changed {
             app?.settings.catBehavior = Settings.CatBehavior.allCases[behavior.indexOfSelectedItem]
@@ -414,6 +481,7 @@ final class NapsPage: SettingsPage {
     private lazy var windows = checkbox("On window title bars", #selector(windowsChanged))
     private lazy var menuBar = checkbox("In the menu bar (1× size only)", #selector(menuBarChanged))
     private lazy var dock = checkbox("On top of the Dock", #selector(dockChanged))
+    private lazy var dockBonk = checkbox("Bonked by the Dock popping up", #selector(dockBonkChanged))
     private lazy var reacts = checkbox("Reacts to your Mac", #selector(reactsChanged))
     private lazy var fullScreen = checkbox("Hide in full-screen apps", #selector(fullScreenChanged))
     private lazy var reduceMotion = checkbox("Keep chasing when Reduce Motion is on", #selector(reduceMotionChanged))
@@ -437,6 +505,8 @@ final class NapsPage: SettingsPage {
         row("", fullScreen)
         row("", reduceMotion)
         gap()
+        row("Dock", dockBonk)
+        note("With the Dock set to hide, cats (and toys) sitting where it slides up get bonked into the air.")
         row("Dock size", dockStatus, dockButton)
         note("Oneko works out how long the Dock is from its icons. With Accessibility access it reads the Dock's exact size instead (it never reads anything else).")
     }
@@ -452,6 +522,8 @@ final class NapsPage: SettingsPage {
         fullScreen.state = s.hideInFullScreen ? .on : .off
         fullScreen.isEnabled = app?.touchBar == nil
         reduceMotion.state = s.ignoreReduceMotion ? .on : .off
+        dockBonk.state = s.dockBonk ? .on : .off
+        dockBonk.isEnabled = app?.touchBar == nil
         let exact = WorldReader.exactDockAllowed
         dockStatus.stringValue = exact ? "Exact (Accessibility allowed)" : "Estimated from its icons"
         dockButton.isHidden = exact
@@ -466,15 +538,50 @@ final class NapsPage: SettingsPage {
     @objc private func reactsChanged() { changed { app?.toggleReacts() } }
     @objc private func fullScreenChanged() { changed { app?.toggleHideInFullScreen() } }
     @objc private func reduceMotionChanged() { changed { app?.toggleIgnoreReduceMotion() } }
+    @objc private func dockBonkChanged() { changed { app?.toggleDockBonk() } }
 }
 
 // MARK: - Toys
 
 final class ToysPage: SettingsPage {
     override var symbol: String { "teddybear" }
-    private lazy var box = checkbox("Cardboard box", #selector(boxChanged))
-    private lazy var bone = checkbox("Bone (throw it to play fetch)", #selector(boneChanged))
-    private lazy var yarn = checkbox("Ball of yarn", #selector(yarnChanged))
+    private let boxFormatter: NumberFormatter = {
+        let f = NumberFormatter()
+        f.numberStyle = .decimal
+        f.allowsFloats = false
+        f.minimum = 0
+        f.maximum = NSNumber(value: Settings.maxBoxes)
+        return f
+    }()
+    private lazy var boxCount: NSTextField = {
+        let t = NSTextField()
+        t.formatter = boxFormatter
+        t.alignment = .right
+        t.target = self
+        t.action = #selector(boxCountChanged)
+        t.widthAnchor.constraint(equalToConstant: 90).isActive = true
+        return t
+    }()
+    private lazy var boxStepper: NSStepper = {
+        let s = NSStepper()
+        s.minValue = 0
+        s.maxValue = Double(Settings.maxBoxes)
+        s.increment = 1
+        s.valueWraps = false
+        s.target = self
+        s.action = #selector(boxStepped)
+        return s
+    }()
+    private lazy var boxLabel = NSTextField(labelWithString: "cardboard boxes")
+    private lazy var bigBox = checkbox("Make the first box a big one (fits 4 cats)", #selector(bigBoxChanged))
+    private lazy var boneCount = countField(max: Settings.maxBones, #selector(boneCountChanged))
+    private lazy var boneStepper = stepper(max: Settings.maxBones, #selector(boneStepped))
+    private lazy var boneLabel = NSTextField(labelWithString: "bones (throw one to play fetch)")
+    private lazy var yarnCount = countField(max: Settings.maxYarns, #selector(yarnCountChanged))
+    private lazy var yarnStepper = stepper(max: Settings.maxYarns, #selector(yarnStepped))
+    private lazy var yarnLabel = NSTextField(labelWithString: "balls of yarn")
+    private lazy var bowlCount = countField(max: Settings.maxBowls, #selector(bowlCountChanged))
+    private lazy var bowlStepper = stepper(max: Settings.maxBowls, #selector(bowlStepped))
     private lazy var laser = checkbox("Laser pointer (follows your cursor)", #selector(laserChanged))
     private lazy var toolbox = checkbox("Toolbox: Paint tools, gravity", #selector(toolboxChanged))
     private lazy var catnip = button("Give Catnip", #selector(catnipPressed))
@@ -486,9 +593,14 @@ final class ToysPage: SettingsPage {
     required init?(coder: NSCoder) { fatalError() }
 
     override func build() {
-        row("Toys", box)
-        row("", bone)
-        row("", yarn)
+        row("Toys", boxCount, boxStepper, boxLabel)
+        row("", bigBox)
+        note("Every cat naps in any free box. The first 50 are real boxes you can carry, throw and shut; the rest pile up in the corner of the screen (drawn by the graphics chip, up to 1,000,000).")
+        row("", boneCount, boneStepper, boneLabel)
+        row("", yarnCount, yarnStepper, yarnLabel)
+        note("Every cat plays with every toy: the closest cat fetches a thrown bone, and any cat chases a rolling ball.")
+        row("", bowlCount, bowlStepper, NSTextField(labelWithString: "food bowls"))
+        note("Cats get hungry every 20–40 minutes; click a bowl to fill it up.")
         row("", laser)
         gap()
         row("Mode", toolbox)
@@ -500,17 +612,37 @@ final class ToysPage: SettingsPage {
     override func refresh() {
         guard let app else { return }
         let desk = app.touchBar == nil
-        box.state = (app.touchBar?.hasBox ?? (app.play.box.state != .hidden)) ? .on : .off
-        bone.state = (app.touchBar?.hasBone ?? (app.play.bone.state != .hidden)) ? .on : .off
-        yarn.state = app.play.yarn.state != .hidden ? .on : .off
+        let n = app.touchBar.map { $0.hasBox ? 1 : 0 } ?? app.settings.boxCount
+        if boxCount.currentEditor() == nil { boxCount.integerValue = n }
+        boxStepper.integerValue = n
+        boxLabel.stringValue = n == 1 ? "cardboard box" : "cardboard boxes"
+        bigBox.state = app.settings.bigBox ? .on : .off
+        bigBox.isEnabled = desk
+        let bones = app.touchBar.map { $0.hasBone ? 1 : 0 } ?? app.settings.boneCount
+        if boneCount.currentEditor() == nil { boneCount.integerValue = bones }
+        boneStepper.integerValue = bones
+        boneLabel.stringValue = bones == 1 ? "bone (throw it to play fetch)" : "bones (throw one to play fetch)"
+        if yarnCount.currentEditor() == nil { yarnCount.integerValue = app.settings.yarnCount }
+        yarnStepper.integerValue = app.settings.yarnCount
+        yarnLabel.stringValue = app.settings.yarnCount == 1 ? "ball of yarn" : "balls of yarn"
+        if bowlCount.currentEditor() == nil { bowlCount.integerValue = app.settings.bowlCount }
+        bowlStepper.integerValue = app.settings.bowlCount
         laser.state = app.laserOn ? .on : .off
         toolbox.state = app.toolbox != nil ? .on : .off
-        for c in [yarn, laser, toolbox, catnip] { c.isEnabled = desk }
+        for c in [yarnCount, yarnStepper, bowlCount, bowlStepper, laser, toolbox, catnip] as [NSControl] {
+            c.isEnabled = desk
+        }
     }
 
-    @objc private func boxChanged() { changed { app?.toggleBox() } }
-    @objc private func boneChanged() { changed { app?.toggleBone() } }
-    @objc private func yarnChanged() { changed { app?.toggleYarn() } }
+    @objc private func boxCountChanged() { changed { app?.setBoxCount(boxCount.integerValue) } }
+    @objc private func boxStepped() { changed { app?.setBoxCount(boxStepper.integerValue) } }
+    @objc private func bigBoxChanged() { changed { app?.toggleBigBox() } }
+    @objc private func boneCountChanged() { changed { app?.setBoneCount(boneCount.integerValue) } }
+    @objc private func boneStepped() { changed { app?.setBoneCount(boneStepper.integerValue) } }
+    @objc private func yarnCountChanged() { changed { app?.setYarnCount(yarnCount.integerValue) } }
+    @objc private func yarnStepped() { changed { app?.setYarnCount(yarnStepper.integerValue) } }
+    @objc private func bowlCountChanged() { changed { app?.setBowlCount(bowlCount.integerValue) } }
+    @objc private func bowlStepped() { changed { app?.setBowlCount(bowlStepper.integerValue) } }
     @objc private func laserChanged() { changed { app?.toggleLaser() } }
     @objc private func toolboxChanged() { changed { app?.toggleToolbox() } }
     @objc private func catnipPressed() { app?.giveCatnip() }
@@ -616,6 +748,7 @@ final class TouchBarPage: SettingsPage {
 final class StatsPage: SettingsPage {
     override var symbol: String { "chart.bar" }
     private var values: [Stats.Key: NSTextField] = [:]
+    private var champions: [CatStats.Key: NSTextField] = [:]
 
     override init(nibName: NSNib.Name?, bundle: Bundle?) {
         super.init(nibName: nil, bundle: nil)
@@ -631,12 +764,25 @@ final class StatsPage: SettingsPage {
             row(k.title, v)
         }
         gap()
+        for k in CatStats.Key.allCases {
+            let v = NSTextField(labelWithString: "–")
+            champions[k] = v
+            row(k.champion, v)
+        }
+        note("Top cats: hover over any cat to see its own stats.")
+        gap()
         row("", button("Reset Stats…", #selector(resetPressed)))
     }
 
     override func refresh() {
         guard let st = app?.stats else { return }
         for (k, v) in values { v.stringValue = k == .highestYeet ? "\(st[k]) pt" : "\(st[k])" }
+        guard let app else { return }
+        for (k, v) in champions {
+            v.stringValue = app.catStats.champion(k, among: max(1, app.settings.catCount)).map {
+                "\(CatNames.name($0.id, custom: app.settings.catNames)) (\($0.value))"
+            } ?? "–"
+        }
     }
 
     @objc private func resetPressed() {
@@ -648,7 +794,7 @@ final class StatsPage: SettingsPage {
         guard let w = view.window else { return }
         alert.beginSheetModal(for: w) { [weak self] r in
             guard r == .alertFirstButtonReturn else { return }
-            self?.changed { self?.app?.stats.reset() }
+            self?.changed { self?.app?.stats.reset(); self?.app?.catStats.reset() }
         }
     }
 }

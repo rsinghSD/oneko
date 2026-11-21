@@ -1,10 +1,55 @@
 import CoreGraphics
 
-enum Thing: Equatable { case cat, bone, box, yarn }
+extension Array {
+    /// The element at `i`, or nil if it's out of range. Lives here, next to its hottest
+    /// callers: without whole-module optimization a generic helper is only specialized
+    /// (no runtime generic metadata lookups) in the file that defines it.
+    subscript(safe i: Int) -> Element? { i >= 0 && i < count ? self[i] : nil }
+}
+
+enum Thing: Equatable { case cat, bone, box, yarn, bowl }
+
+/// Dice for the cats' whims (naps, hunts, idle animations). Thousands of cats roll them every
+/// tick, and the system generator is a cryptographic one that reads the clock on every call;
+/// this is wyrand, seeded once from the system generator. Main thread only, like the cats.
+enum Dice {
+    /// The state, behind a pointer: a plain `static var` would cost an exclusivity check per roll.
+    private static let state: UnsafeMutablePointer<UInt64> = {
+        let p = UnsafeMutablePointer<UInt64>.allocate(capacity: 1)
+        p.pointee = UInt64.random(in: .min ... .max)
+        return p
+    }()
+
+    struct Generator: RandomNumberGenerator {
+        mutating func next() -> UInt64 {
+            Dice.state.pointee &+= 0xa076_1d64_78bd_642f
+            let s = Dice.state.pointee
+            let m = s.multipliedFullWidth(by: s ^ 0xe703_7ed1_a0b4_28db)
+            return m.high ^ m.low
+        }
+    }
+
+    /// A uniform roll in `0..<n` (0 when `n` < 1), like `Int.random(in: 0..<max(n, 1))`.
+    static func roll(_ n: Int) -> Int {
+        var g = Generator()
+        return Int.random(in: 0..<max(n, 1), using: &g)
+    }
+}
 
 /// Somewhere the cat can wander off to for a long nap.
 struct NapSpot: Equatable {
-    enum Kind: Equatable { case box, window(Int), menuBar, dock }
+    /// `box`: one of the real boxes; `heap`: one of the GPU-drawn boxes piled on the floor.
+    enum Kind: Equatable {
+        case box(Int), heap(Int), window(Int), menuBar, dock
+        /// Right where it is (a nap after a good meal).
+        case here
+        var isBox: Bool {
+            switch self {
+            case .box, .heap: return true
+            default: return false
+            }
+        }
+    }
     var kind: Kind
     /// Where the cat's centre sits while napping (global, y-up).
     var point: CGPoint
@@ -29,6 +74,23 @@ enum CatMode: Equatable {
     case chasingYarn(ticksLeft: Int)              // after a rolling ball of yarn
     case zoomies(ticksLeft: Int, target: CGPoint) // catnip!
     case stretching(ticksLeft: Int)               // waking up after you were away
+    case goingToBowl(Int)                         // hungry
+    case eating(Int, ticksLeft: Int)
+    case playing(PlayKind, ticksLeft: Int, leader: Bool)   // with another cat
+}
+
+/// What two cats get up to together.
+enum PlayKind: Equatable, CaseIterable {
+    case groom      // wash each other: hearts
+    case fight      // a scrap: 💢, then they sit it off
+    case chase      // one runs, the other chases
+    var ticks: Int {
+        switch self {
+        case .groom: return 50
+        case .fight: return 30
+        case .chase: return 40
+        }
+    }
 }
 
 enum PropState: Equatable {
@@ -63,6 +125,8 @@ struct CatPose: Equatable {
     var inBox: Bool
     var carryingBone: Bool
     var boxClosed = false
+    /// In a big box: the box's own windows draw it (in front of and behind the cat).
+    var inBigBox = false
     var clipped = false
     /// 1 = solid; the eraser fades it; 0 = rubbed out.
     var opacity: CGFloat = 1
@@ -75,7 +139,211 @@ enum PlaygroundEvent: Equatable {
     case thrown(speed: CGFloat)                           // let go of with some speed
     case apex(height: CGFloat)                            // top of a flight, above where it started
     case landed(impact: CGFloat, onWindow: Int?, at: CGPoint)
-    case fetched, bonked, dockYeet, batYarn, boxHop, woke
+    case fetched, bonked, dockYeet, dockBonk, batYarn, boxHop, woke, ate, played
+}
+
+/// Every toy: cardboard boxes, bones and balls of yarn. One pile is shared by every cat
+/// (it's a class, so all the playgrounds holding it see the same toys): any cat naps in any
+/// free box, fetches any bone and chases any ball of yarn. The first cat's playground (the
+/// one with `ownsToys`) moves them; the others only play with them.
+final class ToyPile {
+    struct Box {
+        var prop: Prop
+        var closed = false
+        /// The cat napping in it (`Playground.catID`).
+        var napper: Int?
+        /// A big box: twice the size, room for `bigSeats` cats, no flaps to shut.
+        var big = false
+        /// The cats in a big box, in seat order.
+        var nappers: [Int] = []
+        var occupied: Bool { big ? !nappers.isEmpty : napper != nil }
+    }
+    static let bigSeats = 4
+    /// A bone or a ball of yarn.
+    struct Toy {
+        var prop: Prop
+        /// Thrown or tossed: a cat should fetch it.
+        var wanted = false
+        /// The cat going for it (or carrying it), and how far off it was: a closer cat takes over.
+        var fetcher: Int?
+        var fetcherDistance: CGFloat = .infinity
+    }
+    /// Real boxes: you can pick them up, throw them and shut them.
+    var boxes: [Box] = [] { didSet { rims = nil } }
+
+    /// A resting box's rim, as a drawing things land on (see `Playground.boxTops`).
+    struct Rim {
+        var index: Int
+        var top: CGFloat
+        var drawing: Drawing
+    }
+    /// The rims of the resting boxes, built once and kept until a box changes. (Every walking
+    /// cat asks for them every frame; building them each time was most of its frame.)
+    private var rims: (scale: CGFloat, list: [Rim])?
+
+    func restingRims(scale s: CGFloat) -> [Rim] {
+        if let r = rims, r.scale == s { return r.list }
+        var list: [Rim] = []
+        for (i, b) in boxes.enumerated() where b.prop.isResting {
+            let top = Self.rimY(b, scale: s)
+            let hw = b.prop.shape.halfW
+            list.append(Rim(index: i, top: top, drawing: Drawing(
+                id: Playground.boxTopID - i, kind: .line,
+                points: [CGPoint(x: b.prop.body.pos.x - hw, y: top), CGPoint(x: b.prop.body.pos.x + hw, y: top)],
+                closed: false, color: RGBA(r: 0, g: 0, b: 0), width: 2)))
+        }
+        rims = (s, list)
+        return list
+    }
+
+    /// The height of a box's rim (where the next box sits).
+    static func rimY(_ b: Box, scale: CGFloat) -> CGFloat {
+        b.prop.body.pos.y + 6 * (b.big ? 2 * scale : scale)
+    }
+    var bones: [Toy] = []
+    var yarns: [Toy] = []
+
+    /// A food bowl: a toy you can move, with a few meals of kibble in it.
+    struct Bowl {
+        var prop: Prop
+        var food = Bowl.full
+        static let full = 8
+    }
+    var bowls: [Bowl] = []
+    /// Boxes past the real ones: a heap on the floor, drawn by the graphics chip. They stay
+    /// put, but a cat can still curl up in one near the top. Centres, global, y-up.
+    var heap: [SIMD2<Float>] = []
+    /// Heap boxes with a cat in them (heap index -> `Playground.catID`).
+    var heapNappers: [Int: Int] = [:]
+    private(set) var scale: CGFloat = 1
+
+    static func shape(_ s: CGFloat, big: Bool = false) -> Shape {
+        let k = big ? 2 * s : s
+        return Shape(halfW: 14 * k, halfH: 16 * k, foot: 1 * k, bounce: 0.15)
+    }
+
+    /// Make box `i` a big box (or a normal one again).
+    func setBig(_ i: Int, _ big: Bool) {
+        guard i < boxes.count, boxes[i].big != big else { return }
+        boxes[i].big = big
+        boxes[i].closed = false
+        boxes[i].prop.shape = Self.shape(scale, big: big)
+        if boxes[i].prop.isResting { boxes[i].prop.state = .flying }   // settle at the new size
+    }
+
+    /// Where cat `cat` sits in box `i`: the middle, or its seat along a big box.
+    func seat(_ i: Int, cat: Int) -> CGPoint? {
+        guard let b = boxes[safe: i] else { return nil }
+        guard b.big else { return b.prop.body.pos }
+        let slot = b.nappers.firstIndex(of: cat) ?? b.nappers.count
+        let xs: [CGFloat] = [-18, 6, -6, 18]
+        return CGPoint(x: b.prop.body.pos.x + xs[slot % xs.count] * scale, y: b.prop.body.pos.y - 10 * scale)
+    }
+    static func boneShape(_ s: CGFloat) -> Shape { Shape(halfW: 8 * s, halfH: 3.5 * s, foot: 0, bounce: 0.45) }
+    static func yarnShape(_ s: CGFloat) -> Shape { Shape(halfW: 6 * s, halfH: 6 * s, foot: 0, bounce: 0.55, rolls: true) }
+    static func newBone(_ s: CGFloat) -> Prop { Prop(shape: boneShape(s), uprightStep: .pi) }
+    static func newYarn(_ s: CGFloat) -> Prop { Prop(shape: yarnShape(s), uprightStep: .pi / 8) }
+    static func bowlShape(_ s: CGFloat) -> Shape { Shape(halfW: 8 * s, halfH: 3.5 * s, foot: 0, bounce: 0.2) }
+
+    var count: Int { boxes.count }
+
+    func setScale(_ s: CGFloat) {
+        guard s != scale else { return }
+        scale = s
+        for i in boxes.indices { boxes[i].prop.shape = Self.shape(s, big: boxes[i].big) }
+        for i in bones.indices { bones[i].prop.shape = Self.boneShape(s) }
+        for i in yarns.indices { yarns[i].prop.shape = Self.yarnShape(s) }
+        for i in bowls.indices { bowls[i].prop.shape = Self.bowlShape(s) }
+    }
+
+    func placeBowl(_ i: Int, at p: CGPoint, falling: Bool) {
+        while bowls.count <= i { bowls.append(Bowl(prop: Prop(shape: Self.bowlShape(scale), uprightStep: 2 * .pi))) }
+        bowls[i].prop.body = Body(pos: p)
+        bowls[i].prop.state = falling ? .flying : .resting(onWindow: nil)
+    }
+
+    /// Put box `i` at `p` (adding boxes up to `i` if needed).
+    func place(_ i: Int, at p: CGPoint, falling: Bool) {
+        while boxes.count <= i {
+            boxes.append(Box(prop: Prop(shape: Self.shape(scale), uprightStep: 2 * .pi)))
+        }
+        boxes[i].prop.body = Body(pos: p)
+        boxes[i].prop.state = falling ? .flying : .resting(onWindow: nil)
+    }
+
+    func placeBone(_ i: Int, at p: CGPoint, falling: Bool) {
+        while bones.count <= i { bones.append(Toy(prop: Self.newBone(scale))) }
+        bones[i] = Toy(prop: bones[i].prop)
+        bones[i].prop.body = Body(pos: p)
+        bones[i].prop.state = falling ? .flying : .resting(onWindow: nil)
+    }
+
+    func placeYarn(_ i: Int, at p: CGPoint, falling: Bool) {
+        while yarns.count <= i { yarns.append(Toy(prop: Self.newYarn(scale))) }
+        yarns[i] = Toy(prop: yarns[i].prop)
+        yarns[i].prop.body = Body(pos: p)
+        yarns[i].prop.state = falling ? .flying : .resting(onWindow: nil)
+    }
+
+    /// Keep only the first `n` boxes (cats napping in the others wake on their next tick).
+    func truncate(_ n: Int) {
+        if boxes.count > n { boxes.removeLast(boxes.count - n) }
+    }
+
+    /// Box `i` is resting, open and nobody's in it (or `cat` is).
+    func isFree(_ i: Int, for cat: Int) -> Bool {
+        guard let b = boxes[safe: i] else { return false }
+        return Self.isFree(b, for: cat)
+    }
+
+    static func isFree(_ b: Box, for cat: Int) -> Bool {
+        guard b.prop.isResting || b.prop.state == .pinned, !b.closed else { return false }
+        if b.big { return b.nappers.contains(cat) || b.nappers.count < Self.bigSeats }
+        return b.napper == nil || b.napper == cat
+    }
+
+    func heapPoint(_ i: Int) -> CGPoint? {
+        guard i >= 0, i < heap.count else { return nil }
+        return CGPoint(x: CGFloat(heap[i].x), y: CGFloat(heap[i].y))
+    }
+
+    /// Any toy moving (held, flying or settling): needs the 60 fps clock.
+    var anyMoving: Bool {
+        boxes.contains { Playground.propMoving($0.prop) } || bones.contains { Playground.propMoving($0.prop) }
+            || yarns.contains { Playground.propMoving($0.prop) } || bowls.contains { Playground.propMoving($0.prop) }
+    }
+}
+
+/// Finds cats sitting next to each other that could play together. A grid of buckets, so
+/// it's linear in the number of cats.
+enum PlayMatcher {
+    /// Pairs of indices into `positions` (only where `free`), each cat in at most one pair.
+    static func pairs(_ positions: [CGPoint], free: [Bool], radius r: CGFloat, chance: (Int) -> Int) -> [(Int, Int)] {
+        var grid: [Int64: [Int]] = [:]
+        func key(_ x: Int, _ y: Int) -> Int64 { Int64(x) << 32 | Int64(UInt32(bitPattern: Int32(y))) }
+        func cell(_ p: CGPoint) -> (Int, Int) { (Int((p.x / r).rounded(.down)), Int((p.y / r).rounded(.down))) }
+        for i in positions.indices where free[i] {
+            let (x, y) = cell(positions[i])
+            grid[key(x, y), default: []].append(i)
+        }
+        var taken = Set<Int>()
+        var out: [(Int, Int)] = []
+        for i in positions.indices where free[i] && !taken.contains(i) {
+            let (x, y) = cell(positions[i])
+            search: for dx in -1...1 {
+                for dy in -1...1 {
+                    for j in grid[key(x + dx, y + dy)] ?? [] where j != i && !taken.contains(j) {
+                        let a = positions[i], b = positions[j]
+                        guard hypot(a.x - b.x, a.y - b.y) < r, chance(4) == 0 else { continue }
+                        taken.insert(i); taken.insert(j)
+                        out.append((i, j))
+                        break search
+                    }
+                }
+            }
+        }
+        return out
+    }
 }
 
 /// The cat, its toys and how they react to the desktop and the mouse. No AppKit.
@@ -86,9 +354,53 @@ struct Playground {
     private(set) var catShape = Shape(halfW: 13, halfH: 16, foot: 3, bounce: 0.35)
     private(set) var squash: CGFloat = 1
     private(set) var angry = false
-    var bone = Prop(shape: Shape(halfW: 8, halfH: 3.5, foot: 0, bounce: 0.45), uprightStep: .pi)
-    var box = Prop(shape: Shape(halfW: 14, halfH: 16, foot: 1, bounce: 0.15), uprightStep: 2 * .pi)
-    var yarn = Prop(shape: Shape(halfW: 6, halfH: 6, foot: 0, bounce: 0.55, rolls: true), uprightStep: .pi / 8)
+    /// Every toy, shared with the other cats.
+    var toys = ToyPile()
+    /// Which cat this is (box and bone claims). The first cat is 0.
+    var catID = 0
+    /// This playground moves the toys (physics, windows, the Dock). Exactly one per pile.
+    var ownsToys = true
+    /// An auto-hiding Dock popping up underneath bonks whatever's sitting there.
+    var dockBonk = true
+    /// The bone this cat is after (or carrying) and the ball of yarn it's chasing, in the
+    /// shared pile. `bone` and `yarn` read and write that one (a hidden stand-in if none).
+    private(set) var boneIndex = 0
+    private(set) var yarnIndex = 0
+    /// Ticks since it last ate, and how many until it's hungry (20–40 minutes).
+    private(set) var hunger = 0
+    private var hungryAfter = 12_000
+    var isHungry: Bool { hunger >= hungryAfter }
+    /// For tests and the demo: skip ahead to dinner time.
+    mutating func makeHungry() { hunger = hungryAfter }
+    /// The cat it's playing with (kept up to date by the app).
+    var partner: CGPoint?
+    private var playTarget: CGPoint?
+
+    /// Free to play with another cat: just sitting about.
+    var canPlay: Bool {
+        @inline(__always) get { !paused && !laser && !gravityMode && mode == .chasing && cat.idleTime > 15 }
+    }
+
+    var isPlaying: Bool { if case .playing = mode { return true }; return false }
+
+    /// Start playing with the cat at `with`. The leader runs in a chase.
+    mutating func startPlay(_ kind: PlayKind, with p: CGPoint, leader: Bool) {
+        partner = p
+        playTarget = nil
+        napFrame = 0
+        mode = .playing(kind, ticksLeft: kind.ticks, leader: leader)
+        if leader { events.append(.played) }
+    }
+    // (`@inline(__always)` on the small helpers below: called from a mutating method, a
+    // non-inlined getter gets a copy of the whole 900-byte playground.)
+    var bone: Prop {
+        @inline(__always) get { toys.bones[safe: boneIndex]?.prop ?? ToyPile.newBone(scale) }
+        set { if boneIndex < toys.bones.count { toys.bones[boneIndex].prop = newValue } }
+    }
+    var yarn: Prop {
+        @inline(__always) get { toys.yarns[safe: yarnIndex]?.prop ?? ToyPile.newYarn(scale) }
+        set { if yarnIndex < toys.yarns.count { toys.yarns[yarnIndex].prop = newValue } }
+    }
 
     /// Laser pointer mode: it dashes after the dot on your cursor and pounces on it.
     var laser = false
@@ -101,7 +413,15 @@ struct Playground {
     /// The velocity you last threw the cat with (zero if it fell or was knocked).
     private(set) var lastThrow = CGVector.zero
     private(set) var scale: CGFloat = 1
-    private(set) var boxClosed = false
+    /// The box it's after on foot (gravity mode).
+    private var walkBox: Int?
+    /// Shut in a closed box after its nap, wanting out.
+    private var rattling = false
+    /// The boxes this cat holds a claim on (it's napping in them).
+    private var claimedBox: Int?
+    /// It has claimed a bone (`claimBone`) and not let go of it since: it may be the fetcher.
+    private var mayHoldBone = false
+    private var claimedHeap: Int?
 
     // Toolbox
     /// Toolbox mode: no floating. Neko falls, and walks along the ground, window tops and
@@ -124,7 +444,7 @@ struct Playground {
     var spotWindows = true
     var spotMenuBar = true
     var spotDock = true
-    var random: (Int) -> Int = { Int.random(in: 0..<max($0, 1)) }
+    var random: (Int) -> Int = { Dice.roll($0) }
 
     private var events: [PlaygroundEvent] = []
     /// The current flight was your doing (a throw or a window you swung), not the cat's.
@@ -134,13 +454,19 @@ struct Playground {
     /// The window (or drawing) a parked cat is sitting on, so it rides along.
     private var stayWindow: Int?
     private var lastScreens: [ScreenInfo] = []
+    /// `world.screenFrames`, kept while the screens stay the same (every tick would otherwise
+    /// build a new array, for every cat).
+    private var frames: (of: [ScreenInfo], frames: [CGRect]) = ([], [])
     private var napFrame = 0
     private var flyFrame = 0
-    private var boneWanted = false
     private var lastWindows: [Int: CGRect] = [:]
+    /// The window list `lastWindows` was built from.
+    private var lastWindowList: [WindowInfo] = []
     private var grab: Grab?
     private var swing: Swing?
     private var boneSwing: Swing?
+    /// The bone that `boneSwing` swings (the one in your hand).
+    private var boneSwingIndex = 0
 
     /// A held cat hangs off the cursor on a short arm and turns with your hand, like a Wii
     /// remote: circle the mouse and it spins around the cursor in step; hold still and it
@@ -160,6 +486,8 @@ struct Playground {
         var start: CGPoint
         var dragging = false
         var samples: [(t: Double, p: CGPoint)]
+        /// Which box, bone or ball of yarn.
+        var index = 0
     }
 
     init(position: CGPoint) {
@@ -169,9 +497,7 @@ struct Playground {
     mutating func setScale(_ s: Int) {
         scale = CGFloat(s)
         applyCatSize()
-        bone.shape = Shape(halfW: 8 * scale, halfH: 3.5 * scale, foot: 0, bounce: 0.45)
-        box.shape = Shape(halfW: 14 * scale, halfH: 16 * scale, foot: 1 * scale, bounce: 0.15)
-        yarn.shape = Shape(halfW: 6 * scale, halfH: 6 * scale, foot: 0, bounce: 0.55, rolls: true)
+        toys.setScale(scale)
     }
 
     private mutating func applyCatSize() {
@@ -199,11 +525,115 @@ struct Playground {
     // MARK: - What to draw
 
     var inBox: Bool {
-        if case .napping(let s, _) = mode, s.kind == .box { return true }
+        if case .napping(let s, _) = mode, s.kind.isBox { return true }
         return false
     }
 
+    /// The real box it's napping in.
+    var boxIndex: Int? {
+        if case .napping(let s, _) = mode, case .box(let i) = s.kind { return i }
+        return nil
+    }
+
+    /// The heap box it's napping in.
+    var heapIndex: Int? {
+        if case .napping(let s, _) = mode, case .heap(let i) = s.kind { return i }
+        return nil
+    }
+
+    /// The first box (the only one on the Touch Bar and in tests); hidden if there's none.
+    var box: Prop {
+        toys.boxes.first?.prop ?? Prop(shape: ToyPile.shape(scale), uprightStep: 2 * .pi)
+    }
+
+    /// Is the box it's in shut? (Not in one: is the first box shut?)
+    var boxClosed: Bool {
+        @inline(__always) get {
+            if heapIndex != nil { return false }
+            return toys.boxes[safe: boxIndex ?? 0]?.closed ?? false
+        }
+    }
+
+    /// Where the box it's in is.
+    private var myBoxPos: CGPoint? {
+        if let i = boxIndex { return toys.seat(i, cat: catID) }
+        if let i = heapIndex { return toys.heapPoint(i) }
+        return nil
+    }
+
+    /// Keep the pile's "who's in which box" in step with what this cat is doing.
+    private mutating func syncClaims() {
+        // (Only a cat that claimed a bone can be its fetcher, so the others skip looking: this
+        // runs every frame for every flying cat.)
+        if !fetchingBone, mayHoldBone {
+            if toys.bones[safe: boneIndex]?.fetcher == catID {
+                toys.bones[boneIndex].fetcher = nil
+                toys.bones[boneIndex].fetcherDistance = .infinity
+            }
+            mayHoldBone = false
+        }
+        let b = boxIndex, h = heapIndex
+        if claimedBox != b {
+            if let c = claimedBox, c < toys.boxes.count {
+                if toys.boxes[c].napper == catID { toys.boxes[c].napper = nil }
+                toys.boxes[c].nappers.removeAll { $0 == catID }
+            }
+            if let n = b, n < toys.boxes.count {
+                if toys.boxes[n].big {
+                    if !toys.boxes[n].nappers.contains(catID) { toys.boxes[n].nappers.append(catID) }
+                } else {
+                    toys.boxes[n].napper = catID
+                }
+            }
+            claimedBox = b
+        }
+        if claimedHeap != h {
+            if let c = claimedHeap, toys.heapNappers[c] == catID { toys.heapNappers[c] = nil }
+            if let n = h { toys.heapNappers[n] = catID }
+            claimedHeap = h
+        }
+    }
+
+    /// This cat is going away: let go of its box.
+    mutating func leaveBoxes() {
+        if inBox { mode = .chasing; cat.wakeUp() }
+        syncClaims()
+    }
+
+    /// Start napping in real box `i`.
+    private mutating func enterBox(_ i: Int) {
+        let p = toys.boxes[i].prop.body.pos
+        napFrame = 0
+        mode = .napping(NapSpot(kind: .box(i), point: p), ticksLeft: 400 + random(800))   // 40 s – 2 min
+        syncClaims()
+        cat.position = toys.seat(i, cat: catID) ?? p
+        catBody = Body(pos: cat.position)
+    }
+
+    /// Napping in a big box (it's drawn by the box's own windows, not the cat's).
+    var inBigBox: Bool { boxIndex.map { toys.boxes[safe: $0]?.big ?? false } ?? false }
+
+    /// The nearest free box to `p`, if any.
+    private func nearestFreeBox(to p: CGPoint, within r: CGFloat = .infinity) -> Int? {
+        var best: (Int, CGFloat)?
+        for i in toys.boxes.indices where toys.isFree(i, for: catID) {
+            let q = toys.boxes[i].prop.body.pos
+            let d = hypot(q.x - p.x, q.y - p.y)
+            if d < r, d < (best?.1 ?? .infinity) { best = (i, d) }
+        }
+        return best?.0
+    }
+
+    /// The box nearest `p` (for grabbing).
+    private func nearestBox(to p: CGPoint) -> Int? {
+        toys.boxes.indices.filter { toys.boxes[$0].prop.isOut }.min {
+            let a = toys.boxes[$0].prop.body.pos, b = toys.boxes[$1].prop.body.pos
+            return hypot(a.x - p.x, a.y - p.y) < hypot(b.x - p.x, b.y - p.y)
+        }
+    }
+
     var catPose: CatPose {
+        @inline(__always) get {
         let physical: Bool
         switch mode {
         case .held, .flying, .landing: physical = true
@@ -212,6 +642,7 @@ struct Playground {
         var showAnger = false
         switch mode {
         case .landing, .dazed: showAnger = angry
+        case .playing(.fight, _, _): showAnger = true
         default: break
         }
         var rattle: CGFloat = 0
@@ -220,24 +651,33 @@ struct Playground {
         }
         return CatPose(sprite: cat.sprite, frame: cat.spriteFrame, center: cat.position,
                        angle: physical ? catBody.angle : 0, squash: squash,
-                       angry: showAnger, inBox: inBox,
+                       angry: showAnger, inBox: inBox && !inBigBox,
                        carryingBone: mode == .returningBone || (mode == .walking && walkGoal == .bringBack),
-                       boxClosed: boxClosed, clipped: { if case .pinned = mode { return true }; return false }(),
+                       boxClosed: boxClosed, inBigBox: inBigBox, clipped: { if case .pinned = mode { return true }; return false }(),
                        opacity: { if case .erased = mode { return 0 }; return hp }(),
                        rattle: rattle)
+        }
     }
 
     /// True while something sits on a window or is in the air, so window positions must be
     /// read every tick (otherwise once a second is plenty).
     var needsWindowTracking: Bool {
-        if catWindow != nil || bone.restingWindow != nil || box.restingWindow != nil || yarn.restingWindow != nil { return true }   // riding something
+        @inline(__always) get {
+        if catWindow != nil { return true }   // riding something
+        if ownsToys {
+            // (Sitting on a box isn't riding a window: no need to read windows for that.)
+            func tracked(_ p: Prop) -> Bool { (p.restingWindow.map { $0 > Self.boxTopID } ?? false) || p.state == .flying }
+            if toys.boxes.contains(where: { tracked($0.prop) }) || toys.bones.contains(where: { tracked($0.prop) })
+                || toys.yarns.contains(where: { tracked($0.prop) }) || toys.bowls.contains(where: { tracked($0.prop) }) { return true }
+        }
         switch mode {
         case .goingToSpot(let s): if case .window = s.kind { return true }
         case .flying, .landing: return true
         case .walking: if !walkArrived { return true }
         default: break
         }
-        return bone.state == .flying || box.state == .flying || yarn.state == .flying
+        return false
+        }
     }
 
     /// Why physics is running (for ONEKO_DEBUG).
@@ -248,7 +688,11 @@ struct Playground {
         case .walking where !walkArrived: r.append("walking")
         default: break
         }
-        for (n, p) in [("bone", bone), ("box", box), ("yarn", yarn)] {
+        let mine = !ownsToys ? [] : toys.boxes.enumerated().map { ("box \($0.offset)", $0.element.prop) }
+            + toys.bones.enumerated().map { ("bone \($0.offset)", $0.element.prop) }
+            + toys.yarns.enumerated().map { ("yarn \($0.offset)", $0.element.prop) }
+            + toys.bowls.enumerated().map { ("bowl \($0.offset)", $0.element.prop) }
+        for (n, p) in mine {
             if p.state == .flying || p.state == .held { r.append("\(n) \(p.state)") }
             if p.isResting && abs(p.body.angle - p.settledAngle) > 0.001 { r.append("\(n) angle \(p.body.angle) vs \(p.settledAngle)") }
         }
@@ -258,52 +702,104 @@ struct Playground {
 
     /// True while anything needs the 60 fps physics clock.
     var needsPhysics: Bool {
+        @inline(__always) get {
         switch mode {
         case .held, .flying, .landing: return true
         case .walking: if !walkArrived { return true }
         default: break
         }
-        for p in [bone, box, yarn] {
-            if p.state == .flying || p.state == .held { return true }
-            if p.isResting && abs(p.body.angle - p.settledAngle) > 0.001 { return true }
+        if ownsToys {
+            if toys.anyMoving { return true }
+        } else if let i = boxIndex, let b = toys.boxes[safe: i], Self.propMoving(b.prop) {
+            return true   // riding in a box that's being carried or thrown
         }
         return squash != 1
+        }
+    }
+
+    static func propMoving(_ p: Prop) -> Bool {
+        if p.state == .flying || p.state == .held { return true }
+        return p.isResting && abs(p.body.angle - p.settledAngle) > 0.001
     }
 
     // MARK: - Toys
 
-    mutating func placeBox(at p: CGPoint, falling: Bool) {
-        box.body = Body(pos: p)
-        box.state = falling ? .flying : .resting(onWindow: nil)
+    /// Put box `index` (the first by default) at `p`.
+    mutating func placeBox(at p: CGPoint, falling: Bool, index: Int = 0) {
+        toys.place(index, at: p, falling: falling)
     }
 
+    /// Put every box away.
     mutating func removeBox() {
-        if inBox { mode = .chasing; cat.wakeUp() }
-        box.state = .hidden
-        boxClosed = false
+        removeBoxes(keeping: 0)
     }
 
-    /// Right-click: fold the flaps shut, or open them. A cat that's done napping in a closed
-    /// box pops out when you open it.
-    mutating func toggleBoxLid() {
-        guard box.state != .hidden else { return }
-        boxClosed.toggle()
-        if !boxClosed, inBox, case .napping(_, let left) = mode, left <= 0 {
-            cat.wakeUp()
-            startFalling(velocity: CGVector(dx: CGFloat(random(400) - 200), dy: 1000))
+    /// Keep only the first `n` toys.
+    mutating func removeBoxes(keeping n: Int) {
+        if let i = boxIndex, i >= n { mode = .chasing; cat.wakeUp() }
+        toys.truncate(n)
+        syncClaims()
+    }
+
+    /// Right-click: fold the flaps of box `index` (default: the one it's in, else the first)
+    /// shut, or open them. A cat that's done napping in a closed box pops out when you open it.
+    mutating func toggleBoxLid(_ index: Int? = nil) {
+        let i = index ?? boxIndex ?? 0
+        guard let b = toys.boxes[safe: i], b.prop.state != .hidden, !b.big else { return }   // big boxes have no flaps
+        toys.boxes[i].closed.toggle()
+        if !toys.boxes[i].closed, boxIndex == i, case .napping(_, let left) = mode, left <= 0 {
+            popOutOfBox()
         }
     }
 
-    mutating func placeBone(at p: CGPoint, falling: Bool) {
-        bone.body = Body(pos: p)
-        bone.state = falling ? .flying : .resting(onWindow: nil)
+    private mutating func popOutOfBox() {
+        rattling = false
+        cat.wakeUp()
+        startFalling(velocity: CGVector(dx: CGFloat(random(400) - 200), dy: 1000))
     }
 
-    mutating func removeBone() {
-        if mode == .fetching || mode == .returningBone { mode = .chasing }
-        walkGoal = .cursor
-        boneWanted = false
-        bone.state = .hidden
+    /// Put bone `index` (the first by default) at `p`.
+    mutating func placeBone(at p: CGPoint, falling: Bool, index: Int = 0) {
+        toys.placeBone(index, at: p, falling: falling)
+    }
+
+    /// Put every bone away.
+    mutating func removeBone() { removeBones(keeping: 0) }
+
+    /// Keep only the first `n` bones (a cat after one of the others gives up).
+    mutating func removeBones(keeping n: Int) {
+        if boneIndex >= n, mode == .fetching || mode == .returningBone { mode = .chasing }
+        if boneIndex >= n, walkGoal == .bone || walkGoal == .bringBack { walkGoal = .cursor }
+        if toys.bones.count > n { toys.bones.removeLast(toys.bones.count - n) }
+        if boneIndex >= max(n, 1) { boneIndex = 0 }
+    }
+
+    /// Is this cat busy with its bone (going for it, or bringing it back)?
+    private var fetchingBone: Bool {
+        mode == .fetching || mode == .returningBone || (mode == .walking && (walkGoal == .bone || walkGoal == .bringBack))
+    }
+
+    /// A thrown bone this cat should go for: the closest free one, or one another cat is
+    /// going for from much further away.
+    private func wantedBone() -> (Int, CGFloat)? {
+        var best: (Int, CGFloat)?
+        let bones = toys.bones   // one read of the shared pile, not one per bone
+        let p = cat.position
+        for i in bones.indices {
+            let b = bones[i]
+            guard b.wanted, b.prop.state == .flying || b.prop.isResting else { continue }
+            let d = hypot(b.prop.body.pos.x - p.x, b.prop.body.pos.y - p.y)
+            guard b.fetcher == nil || b.fetcher == catID || d < b.fetcherDistance - 40 * scale else { continue }
+            if d < (best?.1 ?? .infinity) { best = (i, d) }
+        }
+        return best
+    }
+
+    private mutating func claimBone(_ i: Int, distance d: CGFloat) {
+        boneIndex = i
+        mayHoldBone = true
+        toys.bones[i].fetcher = catID
+        toys.bones[i].fetcherDistance = d
     }
 
     // MARK: - 10 Hz behaviour
@@ -314,7 +810,18 @@ struct Playground {
         if mode == .walking, world.windows.contains(where: { lastWindows[$0.id] != $0.frame }) { walkArrived = false }
         rideWindows(world, dt: dt)
         if world.mouseDown { collide(world, dt: dt) }
-        lastWindows = Dictionary(world.windows.map { ($0.id, $0.frame) }, uniquingKeysWith: { a, _ in a })
+        // Rebuild the lookup only when the list changed (it's shared by every cat, and
+        // usually the same as last time).
+        if !world.windows.elementsEqual(lastWindowList, by: { $0.id == $1.id && $0.frame == $1.frame }) {
+            lastWindows = Dictionary(world.windows.map { ($0.id, $0.frame) }, uniquingKeysWith: { a, _ in a })
+            lastWindowList = world.windows
+        }
+    }
+
+    /// The frames of `world.screens` (cached: the same screens give the same array).
+    private mutating func screenFrames(_ world: World) -> [CGRect] {
+        if world.screens != frames.of { frames = (world.screens, world.screenFrames) }
+        return frames.frames
     }
 
     mutating func tick10(world: World) {
@@ -322,6 +829,8 @@ struct Playground {
         if batCooldown > 0 { batCooldown -= 1 }
         if zoomBoost > 0 { zoomBoost -= 1 }
         defer { batNearbyYarn() }
+        defer { syncClaims() }
+        if !paused { hunger += 1 }
         if gravityMode && mode == .chasing { startWalking() }
         if !gravityMode && mode == .walking { mode = .chasing }
         defer { dockBounce(world) }   // after this tick's moves, so it never sits inside the Dock
@@ -338,15 +847,18 @@ struct Playground {
         }
 
         // Fetch! (Cats in a cardboard box can't be bothered.)
-        if boneWanted, !paused, bone.state == .flying || bone.isResting {
+        // The closest cat goes for a thrown bone; a closer one can take over on the way.
+        if !paused, !fetchingBone, !toys.bones.isEmpty, let (i, d) = wantedBone() {
             switch mode {
             case .chasing, .petted, .goingToSpot:
+                claimBone(i, distance: d)
                 mode = .fetching
-            case .napping(let spot, _) where spot.kind != .box:
+            case .napping(let spot, _) where !spot.kind.isBox:
+                claimBone(i, distance: d)
                 mode = .fetching
             case .walking:
+                claimBone(i, distance: d)
                 walkGoal = .bone          // on foot
-                boneWanted = false
                 walkArrived = false
             default: break
             }
@@ -358,47 +870,75 @@ struct Playground {
                 // Dash after the dot; when it's caught, pounce on it.
                 if cat.walk(to: world.cursor, speedMultiplier: 2.2) { cat.set(.scratchSelf, napFrame); napFrame += 1 }
             } else {
-                cat.tick(cursor: world.cursor, screens: world.screenFrames)
+                cat.tick(cursor: world.cursor, screens: screenFrames(world))
                 if !paused { maybeStartNap(world) }
             }
-            if !paused, !laser, yarn.state == .flying, hypot(yarn.body.vel.dx, yarn.body.vel.dy) > 250 {
-                mode = .chasingYarn(ticksLeft: 50)          // a rolling ball? must chase
+            // Dinner time, and there's kibble out.
+            if !paused, !laser, isHungry, let i = nearestBowlWithFood() {
+                mode = .goingToBowl(i)
+                break
+            }
+            // A rolling ball? Must chase (any ball rolling by).
+            if !paused, !laser, let i = rollingYarn() {
+                yarnIndex = i
+                mode = .chasingYarn(ticksLeft: 50)
             }
 
 
         case .goingToSpot(var spot):
-            if spot.kind == .box {
-                guard box.isResting, !boxClosed else { mode = .chasing; break }
-                spot.point = box.body.pos
+            switch spot.kind {
+            case .box(let i):
+                // Someone else got there first, or it was picked up: never mind.
+                guard toys.isFree(i, for: catID), toys.boxes[i].prop.isResting else { mode = .chasing; break }
+                spot.point = toys.boxes[i].prop.body.pos
+            case .heap(let i):
+                guard let p = toys.heapPoint(i), toys.heapNappers[i] == nil || toys.heapNappers[i] == catID
+                else { mode = .chasing; break }
+                spot.point = p
+            default: break
             }
+            guard case .goingToSpot = mode else { break }
             if cat.walk(to: spot.point) {
-                if spot.kind == .box { events.append(.boxHop) }
+                if spot.kind.isBox { events.append(.boxHop) }
                 napFrame = 0
                 mode = .napping(spot, ticksLeft: 400 + random(800))   // 40 s – 2 min
+                syncClaims()
             } else {
                 mode = .goingToSpot(spot)
             }
 
         case .napping(let spot, let left):
             squash = 1
-            if spot.kind == .box {
+            switch spot.kind {
+            case .box(let i):
                 // The cat stays in the box wherever it goes: carried, thrown or caught.
-                guard box.state != .hidden else { mode = .chasing; cat.wakeUp(); break }
-                cat.position = box.body.pos
-            } else {
+                guard let b = toys.boxes[safe: i], b.prop.state != .hidden else { mode = .chasing; cat.wakeUp(); break }
+                cat.position = toys.seat(i, cat: catID) ?? b.prop.body.pos
+            case .heap(let i):
+                guard let p = toys.heapPoint(i) else { mode = .chasing; cat.wakeUp(); break }
+                cat.position = p
+            default:
                 cat.position = spot.point
             }
+            guard case .napping = mode else { break }
             cat.set(napFrame < 8 ? .tired : .sleeping, napFrame / 4)
             napFrame += 1
-            if left <= 0 {
-                if spot.kind == .box && boxClosed {
+            if left == 0, inBigBox {
+                // The big box: it naps on until you take it out (or double-click it awake).
+                mode = .napping(spot, ticksLeft: 0)
+            } else if left <= 0 {
+                if boxClosed {
+                    rattling = true
                     mode = .napping(spot, ticksLeft: 0)   // wants out: the box rattles
+                } else if rattling {
+                    popOutOfBox()                         // someone opened it: out it pops
                 } else {
                     mode = .chasing
                     cat.wakeUp()
                     events.append(.woke)
                 }
             } else {
+                rattling = left - 1 <= 0 && boxClosed   // nap's over, and it's shut in
                 mode = .napping(spot, ticksLeft: left - 1)
             }
 
@@ -425,20 +965,22 @@ struct Playground {
             mode = left <= 0 ? .chasing : .petted(ticksLeft: left - 1)
 
         case .fetching:
-            guard bone.state == .flying || bone.isResting else { mode = .chasing; break }
+            guard bone.state == .flying || bone.isResting, toys.bones[safe: boneIndex]?.fetcher == catID
+            else { mode = .chasing; break }   // gone, or a closer cat took over
+            toys.bones[boneIndex].fetcherDistance = hypot(cat.position.x - bone.body.pos.x, cat.position.y - bone.body.pos.y)
             // Line the cat's feet up with the bone's bottom.
             let target = CGPoint(x: bone.body.pos.x,
                                  y: bone.body.pos.y - bone.shape.halfH + catShape.halfH - catShape.foot)
             let near = hypot(cat.position.x - bone.body.pos.x, cat.position.y - bone.body.pos.y) < 18 * scale
             if near || cat.walk(to: target, speedMultiplier: 1.3) {
                 bone.state = .carried
-                boneWanted = false
+                toys.bones[boneIndex].wanted = false
                 events.append(.boneTaken)
                 mode = .returningBone
             }
 
         case .returningBone:
-            let c = world.cursor
+            let c = world.pointer ?? world.cursor   // to you, not to its spot in the swarm
             if hypot(c.x - cat.position.x, c.y - cat.position.y) < cat.stopDistance {
                 dropBone(falling: false, toward: c)
                 events.append(.fetched)
@@ -454,10 +996,11 @@ struct Playground {
             mode = .staying(frame: n + 1)
 
         case .chasingYarn(let left):
-            let near = hypot(yarn.body.pos.x - cat.position.x, yarn.body.pos.y - cat.position.y) < catShape.halfW + 8 * scale
-            if !yarn.isOut || yarn.state == .held || left <= 0 || paused {
+            let y = yarn   // (a read of the shared pile each time otherwise)
+            let near = hypot(y.body.pos.x - cat.position.x, y.body.pos.y - cat.position.y) < catShape.halfW + 8 * scale
+            if !y.isOut || y.state == .held || left <= 0 || paused {
                 mode = .chasing
-            } else if near || cat.walk(to: yarn.body.pos, speedMultiplier: 1.5) {
+            } else if near || cat.walk(to: y.body.pos, speedMultiplier: 1.5) {
                 batYarn()
                 mode = .chasing
             } else {
@@ -476,18 +1019,77 @@ struct Playground {
         case .walking:
             let target = walkTarget(world)
             if walkGrounded, walkGoal == .cursor, abs(target.x - cat.position.x) <= 6 {
-                if !walkArrived { cat.wakeUp(); cat.tick(cursor: cat.position, screens: world.screenFrames) }
+                if !walkArrived { cat.wakeUp(); cat.tick(cursor: cat.position, screens: screenFrames(world)) }
                 walkArrived = true
                 // Classic idle life (grooming, yawning, naps) while it waits under you.
-                cat.tick(cursor: cat.position, screens: world.screenFrames)
+                cat.tick(cursor: cat.position, screens: screenFrames(world))
                 // ...and a box nearby is irresistible: walk over and climb in.
-                if !paused, cat.sleepEnabled, box.isResting, !boxClosed, cat.idleTime > 30, random(250) == 0 {
+                if !paused, cat.sleepEnabled, cat.idleTime > 30, random(250) == 0,
+                   let i = nearestFreeBox(to: cat.position), toys.boxes[i].prop.isResting {
                     walkGoal = .nap
+                    walkBox = i
                     walkArrived = false
                 }
             } else {
                 walkArrived = false
             }
+
+        case .goingToBowl(let i):
+            guard !paused, let b = toys.bowls[safe: i], b.prop.isResting, b.food > 0 else { mode = .chasing; break }
+            if cat.walk(to: bowlSpot(b)) {
+                napFrame = 0
+                mode = .eating(i, ticksLeft: 40)
+            }
+
+        case .eating(let i, let left):
+            guard let b = toys.bowls[safe: i], b.prop.isResting else { mode = .chasing; break }
+            cat.position = bowlSpot(b)
+            cat.set(napFrame % 6 < 3 ? .idle : .alert, 0)     // nom, nom
+            napFrame += 1
+            if left <= 0 {
+                if toys.bowls[i].food > 0 { toys.bowls[i].food -= 1 }
+                hunger = 0
+                hungryAfter = 12_000 + random(12_000)
+                events.append(.ate)
+                events.append(.heart)
+                napFrame = 0
+                if random(2) == 0 && cat.sleepEnabled {       // a food coma
+                    mode = .napping(NapSpot(kind: .here, point: cat.position), ticksLeft: 300 + random(300))
+                } else {
+                    mode = .chasing
+                }
+            } else {
+                mode = .eating(i, ticksLeft: left - 1)
+            }
+
+        case .playing(let kind, let left, let leader):
+            let p = partner ?? cat.position
+            guard !paused, left > 0 else {
+                partner = nil
+                if kind == .fight { angry = true; mode = .dazed(ticksLeft: 8, onWindow: nil) }   // sits it off
+                else { mode = .chasing; cat.wakeUp() }
+                break
+            }
+            switch kind {
+            case .groom:
+                cat.set(napFrame % 10 < 5 ? .scratchSelf : .idle, napFrame / 2)
+                if leader && left % 15 == 0 { events.append(.heart) }
+            case .fight:
+                cat.set(p.x >= cat.position.x ? .scratchWallE : .scratchWallW, napFrame / 2)
+            case .chase:
+                if leader {
+                    if playTarget == nil || random(15) == 0 {
+                        let a = CGFloat(random(628)) / 100
+                        let r = (120 + CGFloat(random(120))) * scale
+                        playTarget = CGPoint(x: cat.position.x + cos(a) * r, y: cat.position.y + sin(a) * r)
+                    }
+                    if let t = playTarget, cat.walk(to: clampToScreens(t), speedMultiplier: 1.9) { playTarget = nil }
+                } else {
+                    _ = cat.walk(to: p, speedMultiplier: 2.0)
+                }
+            }
+            napFrame += 1
+            mode = .playing(kind, ticksLeft: left - 1, leader: leader)
 
         case .erased(let left):
             if left <= 0 { respawn(world) } else { mode = .erased(ticksLeft: left - 1) }
@@ -509,6 +1111,7 @@ struct Playground {
 
     mutating func physics(dt: CGFloat, world: World) {
         lastScreens = world.screens
+        if ownsToys { dropUnsupported() }
         switch mode {
         case .walking:
             walk(dt: dt, world: world)
@@ -522,16 +1125,13 @@ struct Playground {
                 rising = false
                 events.append(.apex(height: cat.position.y - launchY))
             }
-            if dropsIntoBox {
+            if let i = dropsIntoBox {
                 // Plop! Straight into the box, and very pleased about it.
-                catBody = Body(pos: box.body.pos)
-                cat.position = box.body.pos
                 angry = false
                 squash = 0.8
-                napFrame = 0
                 events.append(.heart)
                 events.append(.boxHop)
-                mode = .napping(NapSpot(kind: .box, point: box.body.pos), ticksLeft: 400 + random(800))
+                enterBox(i)
                 break
             }
             switch result {
@@ -578,15 +1178,37 @@ struct Playground {
         default:
             squash = 1
         }
-        if bone.state == .held, var s = boneSwing {
-            Self.steer(&s, &bone.body, dt: dt, sway: false)
-            boneSwing = s
-            bone.body.pos = s.pivot
+        if ownsToys {
+            let i = boneSwingIndex
+            if i < toys.bones.count, toys.bones[i].prop.state == .held, var s = boneSwing {
+                Self.steer(&s, &toys.bones[i].prop.body, dt: dt, sway: false)
+                boneSwing = s
+                toys.bones[i].prop.body.pos = s.pivot
+            }
+            for i in toys.boxes.indices where Self.propMoving(toys.boxes[i].prop) {
+                Self.stepProp(&toys.boxes[i].prop, dt: dt, world: boxTops(world, except: i))
+            }
+            // The boxes are done moving for this frame: their rims are the same for every
+            // bone, ball and bowl, so build them once (and only if something's moving).
+            var tops: World?
+            func rims() -> World {
+                if let t = tops { return t }
+                let t = boxTops(world)
+                tops = t
+                return t
+            }
+            for i in toys.bones.indices where Self.propMoving(toys.bones[i].prop) {
+                Self.stepProp(&toys.bones[i].prop, dt: dt, world: rims())
+            }
+            for i in toys.yarns.indices where Self.propMoving(toys.yarns[i].prop) {
+                Self.stepProp(&toys.yarns[i].prop, dt: dt, world: rims())
+            }
+            for i in toys.bowls.indices where Self.propMoving(toys.bowls[i].prop) {
+                Self.stepProp(&toys.bowls[i].prop, dt: dt, world: rims())
+            }
         }
-        Self.stepProp(&bone, dt: dt, world: world)
-        Self.stepProp(&box, dt: dt, world: world)
-        Self.stepProp(&yarn, dt: dt, world: world)
-        if inBox { cat.position = box.body.pos }   // riding in a closed box
+        if let p = myBoxPos { cat.position = p }   // riding in a box
+        syncClaims()
     }
 
     /// Wii-remote turning: every bit the cursor's heading turns, the held thing turns too;
@@ -634,10 +1256,35 @@ struct Playground {
 
     // MARK: - Mouse
 
-    mutating func mouseDown(on thing: Thing, at p: CGPoint, time: Double) {
-        let c = position(of: thing)
+    /// `index`: which box, bone or ball of yarn (default: for a box, the one the cat is in,
+    /// else the nearest; for a bone or yarn, the first).
+    mutating func mouseDown(on thing: Thing, at p: CGPoint, time: Double, index: Int? = nil) {
+        var i = index ?? 0
+        if thing == .box, index == nil { i = boxIndex ?? nearestBox(to: p) ?? 0 }
+        let c = position(of: thing, index: i)
         grab = Grab(thing: thing, offset: CGVector(dx: c.x - p.x, dy: c.y - p.y), start: p,
-                    samples: [(time, p)])
+                    samples: [(time, p)], index: i)
+    }
+
+    /// A toy in the pile by kind and index (nil for the cat, or one that's gone).
+    private func prop(_ thing: Thing, _ i: Int) -> Prop? {
+        switch thing {
+        case .cat: return nil
+        case .box: return toys.boxes[safe: i]?.prop
+        case .bone: return toys.bones[safe: i]?.prop
+        case .yarn: return toys.yarns[safe: i]?.prop
+        case .bowl: return toys.bowls[safe: i]?.prop
+        }
+    }
+
+    private mutating func withProp(_ thing: Thing, _ i: Int, _ f: (inout Prop) -> Void) {
+        switch thing {
+        case .cat: break
+        case .box: if i < toys.boxes.count { f(&toys.boxes[i].prop) }
+        case .bone: if i < toys.bones.count { f(&toys.bones[i].prop) }
+        case .yarn: if i < toys.yarns.count { f(&toys.yarns[i].prop) }
+        case .bowl: if i < toys.bowls.count { f(&toys.bowls[i].prop) }
+        }
     }
 
     mutating func mouseDragged(to p: CGPoint, time: Double) {
@@ -658,12 +1305,12 @@ struct Playground {
                 placeOnSwing()
             case .bone:
                 boneSwing?.pivot = c
-                bone.body.pos = c
+                withProp(.bone, g.index) { $0.body.pos = c }
             case .box:
-                box.body.pos = c
-                if inBox { cat.position = c }
-            case .yarn:
-                yarn.body.pos = c
+                withProp(.box, g.index) { $0.body.pos = c }
+                if boxIndex == g.index { cat.position = toys.seat(g.index, cat: catID) ?? c }
+            case .yarn, .bowl:
+                withProp(g.thing, g.index) { $0.body.pos = c }
             }
         }
         grab = g
@@ -672,7 +1319,7 @@ struct Playground {
     mutating func mouseUp(at p: CGPoint, time: Double, clickCount: Int = 1) {
         guard var g = grab else { return }
         grab = nil
-        guard g.dragging else { click(g.thing, count: clickCount); return }
+        guard g.dragging else { click(g.thing, index: g.index, count: clickCount); return }
         g.samples.append((time, p))
         // Throws carry more than the raw mouse speed: flicks should yeet.
         let raw = Self.velocity(g.samples)
@@ -699,19 +1346,25 @@ struct Playground {
             rising = catBody.vel.dy > 0
             events.append(.thrown(speed: speed))
         case .bone:
-            bone.body.vel = v
-            if abs(bone.body.spin) < 3 { bone.body.spin = max(-30, min(30, -v.dx / 50)) }  // else keep its twirl
+            withProp(.bone, g.index) {
+                $0.body.vel = v
+                if abs($0.body.spin) < 3 { $0.body.spin = max(-30, min(30, -v.dx / 50)) }  // else keep its twirl
+                $0.state = .flying
+            }
             boneSwing = nil
-            bone.state = .flying
-            if speed > 300 { boneWanted = true }
-        case .box:
-            box.body.vel = CGVector(dx: v.dx * 0.7, dy: v.dy * 0.7)
-            box.body.spin = -v.dx / 400
-            box.state = .flying
+            if speed > 300, g.index < toys.bones.count { toys.bones[g.index].wanted = true }
+        case .box, .bowl:
+            withProp(g.thing, g.index) {
+                $0.body.vel = CGVector(dx: v.dx * 0.7, dy: v.dy * 0.7)
+                $0.body.spin = -v.dx / 400
+                $0.state = .flying
+            }
         case .yarn:
-            yarn.body.vel = v
-            yarn.body.spin = -v.dx / 40
-            yarn.state = .flying
+            withProp(.yarn, g.index) {
+                $0.body.vel = v
+                $0.body.spin = -v.dx / 40
+                $0.state = .flying
+            }
         }
     }
 
@@ -728,28 +1381,31 @@ struct Playground {
 
     /// Right-click. Mid-drag: clip whatever you're dragging right there. On a clipped thing:
     /// let go (it falls). On the cat: clip it where it is (even mid-flight). On the box (or
-    /// the cat in it): open/close the flaps.
-    mutating func rightClick(_ thing: Thing) {
+    /// the cat in it): open/close the flaps. `index`: which box, bone or ball of yarn.
+    mutating func rightClick(_ thing: Thing, index: Int? = nil) {
         if let g = grab, g.dragging {
             grab = nil
-            clip(g.thing)
+            clip(g.thing, index: g.index)
             return
         }
         grab = nil
         switch thing {
         case .cat:
-            if inBox { toggleBoxLid(); return }
+            if boxIndex != nil { toggleBoxLid(); return }
+            if heapIndex != nil { return }       // heap boxes have no flaps
             if case .pinned = mode { startFalling(velocity: .zero) } else { clip(.cat) }
         case .box:
-            if box.state == .pinned { Self.unclip(&box) } else { toggleBoxLid() }
-        case .bone:
-            if bone.state == .pinned { Self.unclip(&bone) } else if bone.isOut { clip(.bone) }
-        case .yarn:
-            if yarn.state == .pinned { Self.unclip(&yarn) } else if yarn.isOut { clip(.yarn) }
+            let i = index ?? boxIndex ?? 0
+            guard i < toys.boxes.count else { return }
+            if toys.boxes[i].prop.state == .pinned { Self.unclip(&toys.boxes[i].prop) } else { toggleBoxLid(i) }
+        case .bone, .yarn, .bowl:
+            let i = index ?? 0
+            guard let p = prop(thing, i) else { return }
+            if p.state == .pinned { withProp(thing, i) { Self.unclip(&$0) } } else if p.isOut { clip(thing, index: i) }
         }
     }
 
-    private mutating func clip(_ thing: Thing) {
+    private mutating func clip(_ thing: Thing, index i: Int = 0) {
         switch thing {
         case .cat:
             if mode == .returningBone { dropBone(falling: true) }
@@ -758,22 +1414,20 @@ struct Playground {
             squash = 1
             mode = .pinned(frame: 0)
             cat.set(.idle, 0)
-        case .box:
-            box.state = .pinned
-            box.body.vel = .zero
-            box.body.spin = 0
+            return
         case .bone:
-            if mode == .fetching { mode = .chasing }
-            boneWanted = false
+            if mode == .fetching && boneIndex == i { mode = .chasing }
+            if i < toys.bones.count { toys.bones[i].wanted = false }
             boneSwing = nil
-            bone.state = .pinned
-            bone.body.vel = .zero
-            bone.body.spin = 0
         case .yarn:
-            if case .chasingYarn = mode { mode = .chasing }
-            yarn.state = .pinned
-            yarn.body.vel = .zero
-            yarn.body.spin = 0
+            if case .chasingYarn = mode, yarnIndex == i { mode = .chasing }
+        case .box, .bowl:
+            break
+        }
+        withProp(thing, i) {
+            $0.state = .pinned
+            $0.body.vel = .zero
+            $0.body.spin = 0
         }
     }
 
@@ -803,25 +1457,39 @@ struct Playground {
             mode = .held
             placeOnSwing()
         case .bone:
-            if mode == .fetching || mode == .returningBone { mode = .chasing }
-            if walkGoal == .bone { walkGoal = .cursor }
-            boneWanted = false
-            bone.state = .held
-            bone.body.vel = .zero
-            bone.body.spin = 0
+            // Snatched away from this cat? It gives up (another cat after it gives up on its own).
+            if mode == .fetching && boneIndex == g.index { mode = .chasing }
+            if walkGoal == .bone && boneIndex == g.index { walkGoal = .cursor }
+            guard g.index < toys.bones.count else { return }
+            toys.bones[g.index].wanted = false
+            withProp(.bone, g.index) {
+                $0.state = .held
+                $0.body.vel = .zero
+                $0.body.spin = 0
+            }
             let c = CGPoint(x: p.x + g.offset.dx, y: p.y + g.offset.dy)
-            boneSwing = Swing(pivot: c, prevPivot: c, target: bone.body.angle, length: 0)
+            boneSwing = Swing(pivot: c, prevPivot: c, target: toys.bones[g.index].prop.body.angle, length: 0)
+            boneSwingIndex = g.index
         case .box:
-            box.state = .held   // a cat inside comes along for the ride
-            box.body.vel = .zero
+            withProp(.box, g.index) {   // a cat inside comes along for the ride
+                $0.state = .held
+                $0.body.vel = .zero
+            }
         case .yarn:
-            if case .chasingYarn = mode { mode = .chasing }
-            yarn.state = .held
-            yarn.body.vel = .zero
+            if case .chasingYarn = mode, yarnIndex == g.index { mode = .chasing }
+            withProp(.yarn, g.index) {
+                $0.state = .held
+                $0.body.vel = .zero
+            }
+        case .bowl:
+            withProp(.bowl, g.index) {
+                $0.state = .held
+                $0.body.vel = .zero
+            }
         }
     }
 
-    private mutating func click(_ thing: Thing, count: Int = 1) {
+    private mutating func click(_ thing: Thing, index i: Int = 0, count: Int = 1) {
         switch thing {
         case .cat where count >= 2:
             // Double-click: "stay!" — sleep right here. Double-click a sleeping cat to wake it
@@ -830,7 +1498,7 @@ struct Playground {
                 mode = .chasing
                 cat.wakeUp()
             } else if case .napping(let spot, _) = mode {
-                mode = .napping(spot, ticksLeft: 0)   // wakes on the next tick
+                mode = .napping(spot, ticksLeft: -1)   // wakes on the next tick (even in the big box)
             } else {
                 if mode == .returningBone { dropBone(falling: true) }
                 angry = false
@@ -848,28 +1516,35 @@ struct Playground {
                 break                           // napping cats just get a heart
             }
         case .bone:
-            // One click = a little toss, and off the cat goes.
-            bone.body.vel = CGVector(dx: CGFloat(random(800) - 400), dy: 900)
-            bone.body.spin = CGFloat(random(20) - 10)
-            bone.state = .flying
-            boneWanted = true
+            // One click = a little toss, and off a cat goes.
+            let vx = CGFloat(random(800) - 400), spin = CGFloat(random(20) - 10)
+            withProp(.bone, i) {
+                $0.body.vel = CGVector(dx: vx, dy: 900)
+                $0.body.spin = spin
+                $0.state = .flying
+            }
+            if i < toys.bones.count { toys.bones[i].wanted = true }
         case .box:
             break
+        case .bowl:
+            // Click the bowl: fill it up.
+            if i < toys.bowls.count, toys.bowls[i].food < ToyPile.Bowl.full {
+                toys.bowls[i].food = ToyPile.Bowl.full
+                events.append(.heart)
+            }
         case .yarn:
-            // A little nudge: it rolls off, and the cat can't resist.
-            yarn.body.vel = CGVector(dx: CGFloat(random(2) == 0 ? -350 : 350), dy: 350)
-            yarn.body.spin = CGFloat(random(20) - 10)
-            yarn.state = .flying
+            // A little nudge: it rolls off, and the cats can't resist.
+            let vx: CGFloat = random(2) == 0 ? -350 : 350, spin = CGFloat(random(20) - 10)
+            withProp(.yarn, i) {
+                $0.body.vel = CGVector(dx: vx, dy: 350)
+                $0.body.spin = spin
+                $0.state = .flying
+            }
         }
     }
 
-    private func position(of thing: Thing) -> CGPoint {
-        switch thing {
-        case .cat: return cat.position
-        case .bone: return bone.body.pos
-        case .box: return box.body.pos
-        case .yarn: return yarn.body.pos
-        }
+    private func position(of thing: Thing, index i: Int) -> CGPoint {
+        thing == .cat ? cat.position : (prop(thing, i)?.body.pos ?? cat.position)
     }
 
     static func velocity(_ s: [(t: Double, p: CGPoint)]) -> CGVector {
@@ -882,13 +1557,24 @@ struct Playground {
 
     // MARK: - Helpers
 
-    /// Falling (or dropped) into the opening of a resting box?
-    private var dropsIntoBox: Bool {
-        guard box.isResting || box.state == .held || box.state == .pinned, !boxClosed, catBody.vel.dy <= 0 else { return false }
-        let dx = cat.position.x - box.body.pos.x
-        let dy = cat.position.y - box.body.pos.y
-        let held: CGFloat = box.state == .held ? 1.25 : 1   // catching with the box in hand: a bit easier
-        return abs(dx) < 13 * scale * held && dy > -6 * scale * held && dy < 22 * scale * held
+    /// Falling (or dropped) into the opening of a resting (or held, or clipped) box? Which one.
+    private var dropsIntoBox: Int? {
+        guard catBody.vel.dy <= 0 else { return nil }
+        let boxes = toys.boxes   // one read of the shared pile (this runs every frame, per flying cat)
+        let p = cat.position
+        for i in boxes.indices {
+            let b = boxes[i]
+            // Over its opening? (Checked first: it's cheap, and almost always no.)
+            let dx = p.x - b.prop.body.pos.x
+            let dy = p.y - b.prop.body.pos.y
+            let held: CGFloat = (b.prop.state == .held ? 1.25 : 1) * (b.big ? 2 : 1)   // in hand: a bit easier
+            guard abs(dx) < 13 * scale * held && dy > -6 * scale * held && dy < 22 * scale * held else { continue }
+            guard b.prop.isResting || b.prop.state == .held || b.prop.state == .pinned, !b.closed,
+                  ToyPile.isFree(b, for: catID) || b.prop.state == .held else { continue }
+            if !b.big, b.napper != nil, b.napper != catID { continue }
+            return i
+        }
+        return nil
     }
 
     /// Put the held cat at the end of its arm.
@@ -911,13 +1597,17 @@ struct Playground {
         p.y = min(p.y, cat.position.y - catShape.halfH + catShape.foot + bone.shape.halfH + 2 * scale)
         bone.body = Body(pos: p)
         bone.state = falling ? .flying : .resting(onWindow: nil)
+        if boneIndex < toys.bones.count {
+            toys.bones[boneIndex].fetcher = nil
+            toys.bones[boneIndex].fetcherDistance = .infinity
+        }
         events.append(.boneDropped)
     }
 
     private func landedOnDock(_ world: World) -> Bool {
-        let feet = cat.position.y - catShape.halfH + catShape.foot
+        let feet = cat.position.y - catShape.halfH + catShape.foot, x = cat.position.x
         return world.screens.contains { s in
-            guard let d = s.dock, d.width >= d.height, d.minX <= cat.position.x, cat.position.x <= d.maxX
+            guard let d = s.dock, d.width >= d.height, d.minX <= x, x <= d.maxX
             else { return false }
             return abs(feet - d.maxY) < 2
         }
@@ -964,8 +1654,23 @@ struct Playground {
 
     mutating func chooseSpot(_ world: World) -> NapSpot? {
         var options: [NapSpot] = []
-        if box.isResting && !boxClosed {   // a box is irresistible
-            options += Array(repeating: NapSpot(kind: .box, point: box.body.pos), count: 3)
+        // A box is irresistible: any free one (the nearest of a few picked at random).
+        let free = toys.boxes.indices.filter { toys.isFree($0, for: catID) && toys.boxes[$0].prop.isResting }
+        if !free.isEmpty {
+            let picks = (0..<min(3, free.count)).map { _ in free[random(free.count)] }
+            let i = picks.min {
+                let a = toys.boxes[$0].prop.body.pos, b = toys.boxes[$1].prop.body.pos
+                return hypot(a.x - cat.position.x, a.y - cat.position.y) < hypot(b.x - cat.position.x, b.y - cat.position.y)
+            }!
+            options += Array(repeating: NapSpot(kind: .box(i), point: toys.boxes[i].prop.body.pos), count: 3)
+        }
+        // The heap: one of the boxes near the top (the last ones drawn).
+        if !toys.heap.isEmpty {
+            let n = toys.heap.count
+            let i = n - 1 - random(min(n, 64))
+            if toys.heapNappers[i] == nil, let p = toys.heapPoint(i) {
+                options += Array(repeating: NapSpot(kind: .heap(i), point: p), count: 2)
+            }
         }
         if spotWindows, let s = windowSpot(world) { options.append(s) }
         if spotMenuBar, let s = menuBarSpot(world) { options.append(s) }
@@ -1019,25 +1724,78 @@ struct Playground {
         return nil
     }
 
-    // MARK: - Yarn, catnip, waking up
+    // MARK: - Food
 
-    mutating func placeYarn(at p: CGPoint, falling: Bool) {
-        yarn.body = Body(pos: p)
-        yarn.state = falling ? .flying : .resting(onWindow: nil)
+    /// (A plain loop over a local copy of the bowls: closures mentioning `cat` would copy the
+    /// whole playground, and every hungry cat asks every tick.)
+    @inline(__always) private func nearestBowlWithFood() -> Int? {
+        let bowls = toys.bowls, c = cat.position
+        var best: (Int, CGFloat)?
+        for i in bowls.indices where bowls[i].food > 0 && bowls[i].prop.isResting {
+            let a = bowls[i].prop.body.pos
+            let d = hypot(a.x - c.x, a.y - c.y)
+            if d < (best?.1 ?? .infinity) { best = (i, d) }   // the first of the nearest, like min(by:)
+        }
+        return best?.0
     }
 
-    mutating func removeYarn() {
-        if case .chasingYarn = mode { mode = .chasing }
-        yarn.state = .hidden
+    /// Where it sits to eat: beside the bowl (cats take turns on each side), feet level with it.
+    private func bowlSpot(_ b: ToyPile.Bowl) -> CGPoint {
+        let side: CGFloat = catID % 2 == 0 ? -1 : 1
+        return CGPoint(x: b.prop.body.pos.x + side * (b.prop.shape.halfW + 4 * scale),
+                       y: b.prop.body.pos.y - b.prop.shape.halfH + catShape.halfH - catShape.foot)
+    }
+
+    /// Put bowl `index` at `p`.
+    mutating func placeBowl(at p: CGPoint, falling: Bool, index: Int = 0) {
+        toys.placeBowl(index, at: p, falling: falling)
+    }
+
+    mutating func removeBowls(keeping n: Int) {
+        switch mode {
+        case .goingToBowl(let i) where i >= n, .eating(let i, _) where i >= n: mode = .chasing
+        default: break
+        }
+        if toys.bowls.count > n { toys.bowls.removeLast(toys.bowls.count - n) }
+    }
+
+    // MARK: - Yarn, catnip, waking up
+
+    /// Put ball of yarn `index` (the first by default) at `p`.
+    mutating func placeYarn(at p: CGPoint, falling: Bool, index: Int = 0) {
+        toys.placeYarn(index, at: p, falling: falling)
+    }
+
+    /// Put every ball of yarn away.
+    mutating func removeYarn() { removeYarns(keeping: 0) }
+
+    mutating func removeYarns(keeping n: Int) {
+        if case .chasingYarn = mode, yarnIndex >= n { mode = .chasing }
+        if toys.yarns.count > n { toys.yarns.removeLast(toys.yarns.count - n) }
+        if yarnIndex >= max(n, 1) { yarnIndex = 0 }
+    }
+
+    /// The first ball of yarn rolling by fast enough to chase.
+    @inline(__always) private func rollingYarn() -> Int? {
+        let yarns = toys.yarns   // one read of the shared pile, not one per ball
+        let p = cat.position, r = 900 * scale
+        for i in yarns.indices {
+            let y = yarns[i].prop
+            if y.state == .flying && hypot(y.body.vel.dx, y.body.vel.dy) > 250
+                && hypot(y.body.pos.x - p.x, y.body.pos.y - p.y) < r { return i }
+        }
+        return nil
     }
 
     /// Bat the yarn away (and it rolls off).
     private mutating func batYarn() {
-        guard yarn.isOut, yarn.state != .held, yarn.state != .pinned, batCooldown == 0 else { return }
-        let dir: CGFloat = yarn.body.pos.x >= cat.position.x ? 1 : -1
-        yarn.state = .flying
-        yarn.body.vel = CGVector(dx: dir * CGFloat(500 + random(500)), dy: CGFloat(250 + random(400)))
-        yarn.body.spin = -dir * 12
+        var y = yarn   // one read and one write of the shared pile
+        guard y.isOut, y.state != .held, y.state != .pinned, batCooldown == 0 else { return }
+        let dir: CGFloat = y.body.pos.x >= cat.position.x ? 1 : -1
+        y.state = .flying
+        y.body.vel = CGVector(dx: dir * CGFloat(500 + random(500)), dy: CGFloat(250 + random(400)))
+        y.body.spin = -dir * 12
+        yarn = y
         batCooldown = 12
         cat.set(.scratchSelf, 0)
         events.append(.batYarn)
@@ -1045,13 +1803,20 @@ struct Playground {
 
     /// Walking or sitting right next to the yarn: give it a pat.
     private mutating func batNearbyYarn() {
-        guard yarn.isResting, !paused, batCooldown == 0 else { return }
+        guard !paused, batCooldown == 0, !toys.yarns.isEmpty else { return }
         switch mode {
         case .chasing, .walking, .petted: break
         default: return
         }
-        let d = hypot(yarn.body.pos.x - cat.position.x, yarn.body.pos.y - cat.position.y)
-        if d < catShape.halfW + 6 * scale { batYarn() }
+        let reach = catShape.halfW + 6 * scale
+        let yarns = toys.yarns, p = cat.position
+        guard let i = yarns.indices.first(where: {
+            let y = yarns[$0].prop
+            return y.isResting && abs(y.body.pos.x - p.x) < reach
+                && hypot(y.body.pos.x - p.x, y.body.pos.y - p.y) < reach
+        }) else { return }
+        yarnIndex = i
+        batYarn()
     }
 
     /// Catnip: zoomies for ~12 seconds.
@@ -1071,8 +1836,16 @@ struct Playground {
         }
     }
 
+    private func clampToScreens(_ p: CGPoint) -> CGPoint {
+        let c = cat.position   // (a closure mentioning `cat` would copy the whole playground)
+        guard let s = lastScreens.first(where: { $0.frame.contains(c) }) ?? lastScreens.first else { return p }
+        let r = s.visible.insetBy(dx: catShape.halfW, dy: catShape.halfH)
+        return CGPoint(x: min(max(p.x, r.minX), r.maxX), y: min(max(p.y, r.minY), r.maxY))
+    }
+
     private func randomSpot() -> CGPoint {
-        guard let s = lastScreens.first(where: { $0.frame.contains(cat.position) }) ?? lastScreens.first else {
+        let c = cat.position   // (a closure mentioning `cat` would copy the whole playground)
+        guard let s = lastScreens.first(where: { $0.frame.contains(c) }) ?? lastScreens.first else {
             return cat.position
         }
         let r = s.visible.insetBy(dx: catShape.halfW * 2, dy: catShape.halfH * 2)
@@ -1117,9 +1890,20 @@ struct Playground {
                 walkArrived = false
             }
         }
-        if bone.isResting || bone.state == .pinned { bone.body.pos.x = clamp(bone.body.pos.x, bone.shape.halfW) }
-        if yarn.isResting || yarn.state == .pinned { yarn.body.pos.x = clamp(yarn.body.pos.x, yarn.shape.halfW) }
-        if box.isResting || box.state == .pinned { box.body.pos.x = clamp(box.body.pos.x, box.shape.halfW) }
+        if ownsToys {
+            for i in toys.bones.indices where toys.bones[i].prop.isResting || toys.bones[i].prop.state == .pinned {
+                toys.bones[i].prop.body.pos.x = clamp(toys.bones[i].prop.body.pos.x, toys.bones[i].prop.shape.halfW)
+            }
+            for i in toys.yarns.indices where toys.yarns[i].prop.isResting || toys.yarns[i].prop.state == .pinned {
+                toys.yarns[i].prop.body.pos.x = clamp(toys.yarns[i].prop.body.pos.x, toys.yarns[i].prop.shape.halfW)
+            }
+            for i in toys.bowls.indices where toys.bowls[i].prop.isResting || toys.bowls[i].prop.state == .pinned {
+                toys.bowls[i].prop.body.pos.x = clamp(toys.bowls[i].prop.body.pos.x, toys.bowls[i].prop.shape.halfW)
+            }
+            for i in toys.boxes.indices where toys.boxes[i].prop.isResting || toys.boxes[i].prop.state == .pinned {
+                toys.boxes[i].prop.body.pos.x = clamp(toys.boxes[i].prop.body.pos.x, toys.boxes[i].prop.shape.halfW)
+            }
+        }
     }
 
     // MARK: - Gravity walking (Toolbox)
@@ -1137,19 +1921,24 @@ struct Playground {
         walkArrived = false
     }
 
-    private func walkTarget(_ world: World) -> CGPoint {
+    @inline(__always) private func walkTarget(_ world: World) -> CGPoint {
         if paused { return cat.position }
         switch walkGoal {
         case .bone where bone.state == .flying || bone.isResting: return bone.body.pos
-        case .nap where box.isResting: return box.body.pos
+        case .nap: return walkBox.flatMap { toys.boxes[safe: $0]?.prop.body.pos } ?? world.cursor
         default: return world.cursor
         }
     }
 
     private mutating func walk(dt: CGFloat, world: World) {
         walkFrame += 1
-        if walkGoal == .bone && !(bone.state == .flying || bone.isResting) { walkGoal = .cursor }
-        if walkGoal == .nap && !(box.isResting && !boxClosed) { walkGoal = .cursor }
+        if walkGoal == .bone && (!(bone.state == .flying || bone.isResting) || toys.bones[safe: boneIndex]?.fetcher != catID) {
+            walkGoal = .cursor     // gone, or a closer cat took over
+        }
+        if walkGoal == .nap && !(walkBox.map { toys.isFree($0, for: catID) && toys.boxes[$0].prop.isResting } ?? false) {
+            walkGoal = .cursor
+            walkBox = nil
+        }
         let target = walkTarget(world)
         let dx = target.x - cat.position.x
         let moving = abs(dx) > 6 && !walkArrived
@@ -1157,7 +1946,9 @@ struct Playground {
             * (zoomBoost > 0 ? 3 : 1) * (laser ? 2.2 : 1)
         catBody.pos = cat.position
         catBody.vel.dx = moving ? (dx > 0 ? speed : -speed) : 0
-        let result = Physics.step(&catBody, shape: catShape, dt: dt, world: world)
+        if moving { hopOntoBox(toward: dx, target: target) }
+        let feet = cat.position.y - catShape.halfH + catShape.foot
+        let result = Physics.step(&catBody, shape: catShape, dt: dt, world: boxTops(world, above: feet))
         cat.position = catBody.pos
         switch result {
         case .rested(_, let impact):
@@ -1181,12 +1972,11 @@ struct Playground {
         }
 
         // Reached the box: hop in for a nap.
-        if walkGoal == .nap, walkGrounded, abs(box.body.pos.x - cat.position.x) < 8 {
+        if walkGoal == .nap, walkGrounded, let i = walkBox, abs(toys.boxes[i].prop.body.pos.x - cat.position.x) < 8 {
             walkGoal = .cursor
-            napFrame = 0
-            cat.position = box.body.pos
+            walkBox = nil
             events.append(.boxHop)
-            mode = .napping(NapSpot(kind: .box, point: box.body.pos), ticksLeft: 400 + random(800))
+            enterBox(i)
             return
         }
 
@@ -1194,13 +1984,14 @@ struct Playground {
         if walkGoal == .bone, abs(bone.body.pos.x - cat.position.x) < 14 * scale,
            abs(bone.body.pos.y - cat.position.y) < 30 * scale {
             bone.state = .carried
+            toys.bones[boneIndex].wanted = false
             walkGoal = .bringBack
             events.append(.boneTaken)
         }
         if walkGoal == .bringBack {
             bone.body.pos = cat.position
             if !moving && walkGrounded {
-                dropBone(falling: true, toward: world.cursor)
+                dropBone(falling: true, toward: world.pointer ?? world.cursor)
                 events.append(.fetched)
                 walkGoal = .cursor
             }
@@ -1305,14 +2096,29 @@ struct Playground {
     private var lastDocks: [CGRect] = []
     /// Ticks of grace after a Dock yeet, so it can't loop.
     private var dockCooldown = 0
+    /// The Docks have been read at least once (so the very first tick isn't "it just appeared").
+    private var docksSeen = false
 
     /// A cat that follows your cursor into a showing Dock gets yeeted up and out of it.
     /// Merely dipping its feet in (chasing a cursor just above the Dock), a Dock appearing
     /// underneath it, or being just after a yeet only nudges it back on top, so it never
     /// glitches on the ground.
+    /// Is `screens.compactMap(\.dock)` equal to `docks`? (Without building it.)
+    private static func sameDocks(_ screens: [ScreenInfo], _ docks: [CGRect]) -> Bool {
+        var k = 0
+        for s in screens {
+            guard let d = s.dock else { continue }
+            guard k < docks.count, docks[k] == d else { return false }
+            k += 1
+        }
+        return k == docks.count
+    }
+
     private mutating func dockBounce(_ world: World) {
-        let docks = world.screens.compactMap(\.dock)
-        defer { lastDocks = docks }
+        // The same Docks as last tick (nearly always): keep that array instead of a new one.
+        let docks = Self.sameDocks(world.screens, lastDocks) ? lastDocks : world.screens.compactMap(\.dock)
+        let seen = docksSeen
+        defer { lastDocks = docks; docksSeen = true }
         if dockCooldown > 0 { dockCooldown -= 1 }
 
         // A Dock went away (auto-hide, or it moved to another display), or got shorter (an
@@ -1331,15 +2137,18 @@ struct Playground {
                 stayWindow = nil
                 startFalling(velocity: .zero)
             }
-            for i in 0..<2 {
-                var p = i == 0 ? bone : box
+            func drop(_ p: inout Prop) {
                 let bottom = p.body.pos.y - p.shape.halfH + p.shape.foot
                 if p.isResting, p.restingWindow == nil, abs(bottom - d.maxY) < 1.5,
                    p.body.pos.x >= d.minX, p.body.pos.x <= d.maxX, gone(p.body.pos.x) {
                     p.state = .flying
                     p.body.vel = .zero
-                    if i == 0 { bone = p } else { box = p }
                 }
+            }
+            if ownsToys {
+                for i in toys.boxes.indices { drop(&toys.boxes[i].prop) }
+                for i in toys.bones.indices { drop(&toys.bones[i].prop) }
+                for i in toys.bowls.indices { drop(&toys.bowls[i].prop) }
             }
         }
         for s in world.screens {
@@ -1347,6 +2156,9 @@ struct Playground {
             let left = d.minX <= s.frame.minX + 1 && d.height > d.width
             let right = d.maxX >= s.frame.maxX - 1 && d.height > d.width
             let wasThere = lastDocks.contains { $0.intersects(d) }
+            // An auto-hiding Dock just popped up under it: bonk! (Unless that's turned off, or
+            // this is the first look at the Dock since launch.)
+            let popBonk = !wasThere && dockBonk && seen
 
             func feetIn(_ p: CGPoint, _ shape: Shape, margin: CGFloat = 0.01) -> Bool {
                 d.contains(CGPoint(x: p.x, y: p.y - shape.halfH + shape.foot + margin))
@@ -1382,23 +2194,42 @@ struct Playground {
                 catBody.spin = -v.dx / 150 + CGFloat(random(200) - 100) / 30
                 dockCooldown = 20              // 2 s of grace
                 events.append(.dockYeet)
+            } else if grounded, popBonk, dockCooldown == 0, feetIn(cat.position, catShape) {
+                let v = out()
+                startFalling(velocity: v)
+                catBody.spin = -v.dx / 150 + CGFloat(random(200) - 100) / 30
+                dockCooldown = 20
+                events.append(.dockBonk)
             } else if grounded, feetIn(cat.position, catShape) {
-                do {
-                    cat.position = onTop(cat.position, catShape)   // just a dip: back on top
-                    catBody.pos = cat.position
+                cat.position = onTop(cat.position, catShape)   // just a dip: back on top
+                catBody.pos = cat.position
+            }
+            let launchProps = wasThere || popBonk
+            func shove(_ p: inout Prop, spin: Int) {
+                guard p.isResting, feetIn(p.body.pos, p.shape, margin: 2 * scale) else { return }
+                if launchProps {
+                    p.body.vel = out()
+                    if spin > 0 { p.body.spin = CGFloat(random(2 * spin) - spin) }
+                    p.state = .flying
+                } else {
+                    p.body.pos = onTop(p.body.pos, p.shape)
                 }
             }
-            if yarn.isResting, feetIn(yarn.body.pos, yarn.shape, margin: 2 * scale) {
-                if wasThere { yarn.body.vel = out(); yarn.state = .flying }
-                else { yarn.body.pos = onTop(yarn.body.pos, yarn.shape) }
-            }
-            if bone.isResting, feetIn(bone.body.pos, bone.shape, margin: 2 * scale) {
-                if wasThere { bone.body.vel = out(); bone.body.spin = CGFloat(random(30) - 15); bone.state = .flying }
-                else { bone.body.pos = onTop(bone.body.pos, bone.shape) }
-            }
-            if box.isResting, feetIn(box.body.pos, box.shape, margin: 2 * scale) {
-                if wasThere { box.body.vel = out(); box.body.spin = CGFloat(random(6) - 3); box.state = .flying }
-                else { box.body.pos = onTop(box.body.pos, box.shape) }
+            if ownsToys {
+                for i in toys.yarns.indices { shove(&toys.yarns[i].prop, spin: 0) }
+                for i in toys.bones.indices { shove(&toys.bones[i].prop, spin: 15) }
+                for i in toys.bowls.indices { shove(&toys.bowls[i].prop, spin: 0) }
+                for i in toys.boxes.indices where toys.boxes[i].prop.isResting {
+                    let b = toys.boxes[i].prop
+                    guard feetIn(b.body.pos, b.shape, margin: 2 * scale) else { continue }
+                    if launchProps {
+                        toys.boxes[i].prop.body.vel = out()
+                        toys.boxes[i].prop.body.spin = CGFloat(random(6) - 3)
+                        toys.boxes[i].prop.state = .flying
+                    } else {
+                        toys.boxes[i].prop.body.pos = onTop(b.body.pos, b.shape)
+                    }
+                }
             }
         }
     }
@@ -1420,7 +2251,64 @@ struct Playground {
         return Physics.clampSpeed(CGVector(dx: v.dx * 1.6, dy: v.dy * 1.8 + 300))
     }
 
+    // MARK: - Stacking boxes
+
+    /// Drawing ids for box rims (box `i` is `boxTopID - i`).
+    static let boxTopID = -1_000_000
+
+    /// `world` plus the rims of the resting boxes as platforms: things land on boxes and
+    /// boxes stack. `above`: only rims below those feet (one-way, for climbing cats).
+    func boxTops(_ world: World, except j: Int? = nil, above feet: CGFloat? = nil) -> World {
+        guard !toys.boxes.isEmpty else { return world }
+        var w = world
+        let rims = toys.restingRims(scale: scale)   // (built once, shared)
+        var grown = false
+        for r in rims where r.index != j {
+            if let f = feet, f < r.top - 3 * scale { continue }
+            if !grown { w.drawings.reserveCapacity(world.drawings.count + rims.count); grown = true }   // one allocation
+            w.drawings.append(r.drawing)
+        }
+        return w
+    }
+
+    /// The height of a box's rim (where the next box sits).
+    private func rimY(_ b: ToyPile.Box) -> CGFloat { ToyPile.rimY(b, scale: scale) }
+
+    /// A box taken out from under a stack: whatever sat on it falls.
+    private mutating func dropUnsupported() {
+        let resting = toys.boxes.map(\.prop.isResting)
+        func check(_ p: inout Prop) {
+            guard let id = p.restingWindow, id <= Self.boxTopID else { return }
+            if !(resting[safe: Self.boxTopID - id] ?? false) { p.state = .flying; p.body.vel = .zero }
+        }
+        for i in toys.boxes.indices { check(&toys.boxes[i].prop) }
+        for i in toys.bones.indices { check(&toys.bones[i].prop) }
+        for i in toys.yarns.indices { check(&toys.yarns[i].prop) }
+        for i in toys.bowls.indices { check(&toys.bowls[i].prop) }
+    }
+
+    /// Walking (gravity mode) toward something past or above a box: hop up onto its rim.
+    private mutating func hopOntoBox(toward dx: CGFloat, target: CGPoint) {
+        guard walkGrounded, abs(dx) > 6 else { return }
+        let dir: CGFloat = dx > 0 ? 1 : -1
+        let feet = cat.position.y - catShape.halfH + catShape.foot
+        let ahead = cat.position.x + dir * (catShape.halfW + 6 * scale)
+        for b in toys.boxes where b.prop.isResting {
+            let top = rimY(b)
+            let rise = top - feet
+            guard rise > 4 * scale, rise < 90 * scale, abs(ahead - b.prop.body.pos.x) < b.prop.shape.halfW,
+                  target.y > top || abs(target.x - b.prop.body.pos.x) > b.prop.shape.halfW   // it's on the way
+            else { continue }
+            catBody.vel.dy = (2 * Physics.gravity * (rise + 14 * scale)).squareRoot()
+            walkGrounded = false
+            return
+        }
+    }
+
     private mutating func rideWindows(_ world: World, dt: CGFloat) {
+        // Nothing sitting on a window or a drawing: nothing to do (and no box rims to build).
+        guard ridesSomething else { return }
+        let world = boxTops(world)   // things sitting on boxes ride them
         func ride(_ id: Int, apply: (CGVector) -> Void) -> Bool? {   // nil: window gone; false: launched
             guard let d = windowDelta(id, world) else { return nil }
             if let v = launch(d, dt: dt, mouseDown: world.mouseDown) {
@@ -1469,9 +2357,34 @@ struct Playground {
         default:
             break
         }
-        Self.rideProp(&bone, world: world, last: lastWindows, dt: dt, launch: launch)
-        Self.rideProp(&box, world: world, last: lastWindows, dt: dt, launch: launch)
-        Self.rideProp(&yarn, world: world, last: lastWindows, dt: dt, launch: launch)
+        if ownsToys {
+            for i in toys.bones.indices where toys.bones[i].prop.restingWindow != nil {
+                Self.rideProp(&toys.bones[i].prop, world: world, last: lastWindows, dt: dt, launch: launch)
+            }
+            for i in toys.yarns.indices where toys.yarns[i].prop.restingWindow != nil {
+                Self.rideProp(&toys.yarns[i].prop, world: world, last: lastWindows, dt: dt, launch: launch)
+            }
+            for i in toys.bowls.indices where toys.bowls[i].prop.restingWindow != nil {
+                Self.rideProp(&toys.bowls[i].prop, world: world, last: lastWindows, dt: dt, launch: launch)
+            }
+            for i in toys.boxes.indices where toys.boxes[i].prop.restingWindow != nil {
+                Self.rideProp(&toys.boxes[i].prop, world: world, last: lastWindows, dt: dt, launch: launch)
+            }
+        }
+    }
+
+    /// Is anything this playground moves sitting on a window or a drawing (see `rideWindows`)?
+    private var ridesSomething: Bool {
+        switch mode {
+        case .napping(let s, _): if case .window = s.kind { return true }
+        case .goingToSpot(let s): if case .window = s.kind { return true }
+        case .staying: if stayWindow != nil { return true }
+        case .dazed(_, let w): if w != nil { return true }
+        default: break
+        }
+        guard ownsToys else { return false }
+        return toys.bones.contains { $0.prop.restingWindow != nil } || toys.yarns.contains { $0.prop.restingWindow != nil }
+            || toys.bowls.contains { $0.prop.restingWindow != nil } || toys.boxes.contains { $0.prop.restingWindow != nil }
     }
 
     private static func rideProp(_ p: inout Prop, world: World, last: [Int: CGRect], dt: CGFloat,
@@ -1529,21 +2442,37 @@ struct Playground {
             } else if mode == .flying, hits(cat.position) {
                 paddle(old: old, new: new, id: w.id, dt: dt)
             }
-            if yarn.isResting || yarn.state == .flying, yarn.restingWindow != w.id, hits(yarn.body.pos) {
-                yarn.body.vel = Self.knock(Self.push(old, new, at: yarn.body.pos, dt: dt))
-                yarn.body.spin = -yarn.body.vel.dx / 30
-                yarn.state = .flying
-            }
-            if bone.isResting || bone.state == .flying, bone.restingWindow != w.id, hits(bone.body.pos) {
-                let v = Self.knock(Self.push(old, new, at: bone.body.pos, dt: dt))
-                bone.body.vel = Physics.clampSpeed(CGVector(dx: v.dx + bone.body.vel.dx * 0.3, dy: v.dy))
-                bone.body.spin = -bone.body.vel.dx / 50
-                bone.state = .flying
-            }
-            if box.isResting, box.restingWindow != w.id, !inBox || boxClosed, hits(box.body.pos) {
-                box.body.vel = Self.knock(Self.push(old, new, at: box.body.pos, dt: dt))
-                box.body.spin = -box.body.vel.dx / 400
-                box.state = .flying
+            if ownsToys {
+                for i in toys.yarns.indices {
+                    let y = toys.yarns[i].prop
+                    guard y.isResting || y.state == .flying, y.restingWindow != w.id, hits(y.body.pos) else { continue }
+                    toys.yarns[i].prop.body.vel = Self.knock(Self.push(old, new, at: y.body.pos, dt: dt))
+                    toys.yarns[i].prop.body.spin = -toys.yarns[i].prop.body.vel.dx / 30
+                    toys.yarns[i].prop.state = .flying
+                }
+                for i in toys.bowls.indices {
+                    let b = toys.bowls[i].prop
+                    guard b.isResting, b.restingWindow != w.id, hits(b.body.pos) else { continue }
+                    toys.bowls[i].prop.body.vel = Self.knock(Self.push(old, new, at: b.body.pos, dt: dt))
+                    toys.bowls[i].prop.state = .flying
+                }
+                for i in toys.bones.indices {
+                    let b = toys.bones[i].prop
+                    guard b.isResting || b.state == .flying, b.restingWindow != w.id, hits(b.body.pos) else { continue }
+                    let v = Self.knock(Self.push(old, new, at: b.body.pos, dt: dt))
+                    toys.bones[i].prop.body.vel = Physics.clampSpeed(CGVector(dx: v.dx + b.body.vel.dx * 0.3, dy: v.dy))
+                    toys.bones[i].prop.body.spin = -toys.bones[i].prop.body.vel.dx / 50
+                    toys.bones[i].prop.state = .flying
+                }
+                for i in toys.boxes.indices {
+                    let b = toys.boxes[i]
+                    // A box with a cat napping in it (flaps open) stays put; a shut one gets knocked.
+                    guard b.prop.isResting, b.prop.restingWindow != w.id, !b.occupied || b.closed,
+                          hits(b.prop.body.pos) else { continue }
+                    toys.boxes[i].prop.body.vel = Self.knock(Self.push(old, new, at: b.prop.body.pos, dt: dt))
+                    toys.boxes[i].prop.body.spin = -toys.boxes[i].prop.body.vel.dx / 400
+                    toys.boxes[i].prop.state = .flying
+                }
             }
         }
     }
@@ -1594,4 +2523,20 @@ struct Playground {
         if m < 1100, m > 0 { k = CGVector(dx: k.dx / m * 1100, dy: k.dy / m * 1100) }
         return Physics.clampSpeed(k)
     }
+}
+
+// MARK: - Reading in place
+
+extension Playground {
+    // A playground is a big struct (about 900 bytes). Calling a getter on one that sits in an
+    // array or a class copies all of it first, even when it reads one field. These take it
+    // `inout` (by address) with the getter inlined, so the loops over every cat read each
+    // one where it is.
+    static func pose(_ p: inout Playground) -> CatPose { p.catPose }
+    static func needsPhysics(_ p: inout Playground) -> Bool { p.needsPhysics }
+    static func needsWindowTracking(_ p: inout Playground) -> Bool { p.needsWindowTracking }
+    static func canPlay(_ p: inout Playground) -> Bool { p.canPlay }
+    static func isPlaying(_ p: inout Playground) -> Bool { p.isPlaying }
+    static func catScale(_ p: inout Playground) -> CGFloat { p.catScale }
+    static func inBigBox(_ p: inout Playground) -> Bool { p.inBigBox }
 }

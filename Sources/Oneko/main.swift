@@ -1,5 +1,10 @@
 import AppKit
 
+if CommandLine.arguments.contains("--bench") {
+    Bench.run()
+    exit(0)
+}
+
 if CommandLine.arguments.contains("--selftest") {
     exit(SelfTest.run() ? 0 : 1)
 }
@@ -34,12 +39,34 @@ guard let sprites = SpriteSheet.load() else {
 if let i = CommandLine.arguments.firstIndex(of: "--crowd-png"), i + 1 < CommandLine.arguments.count {
     let crowd = CrowdController()
     let screen = CGRect(x: 0, y: 0, width: 1146, height: 480)   // ultrawide-shaped
+    let withHeap = CommandLine.arguments.contains("--with-heap")
+    let heapBoxes = withHeap ? BoxHeap.layout(count: 120, screens: [screen], scale: 1) : []
+    crowd.setHeap(heapBoxes)
     if crowd.selfCheck(count: 6000, sheets: (0..<12).map { sprites.recolored(Skin.random(seed: $0)) } + [sprites],
                        ticks: 120, cursor: CGPoint(x: 573, y: 240), screen: screen) != nil,
        let snap = crowd.lastSnapshot {
         var rgba = snap.pixels
+        if withHeap, let under = BoxHeap().snapshot(heapBoxes, scale: 1, frame: screen) {   // heap window under the crowd
+            for p in stride(from: 0, to: rgba.count, by: 4) where rgba[p + 3] == 0 {
+                for k in 0..<4 { rgba[p + k] = under[p + k] }
+            }
+        }
         for p in stride(from: 0, to: rgba.count, by: 4) { rgba.swapAt(p, p + 2) }   // BGRA -> RGBA
         if let img = PixelArt.makeImage(rgba, width: snap.width, height: snap.height) {
+            try? NSBitmapImageRep(cgImage: img).representation(using: .png, properties: [:])?
+                .write(to: URL(fileURLWithPath: CommandLine.arguments[i + 1]))
+        }
+    }
+    exit(0)
+}
+
+// Dev helper: `Oneko --heap-png out.png [count]` draws a box heap offscreen (real GPU code).
+if let i = CommandLine.arguments.firstIndex(of: "--heap-png"), i + 1 < CommandLine.arguments.count {
+    let n = CommandLine.arguments.count > i + 2 ? Int(CommandLine.arguments[i + 2]) ?? 300 : 300
+    let screen = CGRect(x: 0, y: 0, width: 1440, height: 900)
+    if var px = BoxHeap().snapshot(BoxHeap.layout(count: n, screens: [screen], scale: 1), scale: 1, frame: screen) {
+        for p in stride(from: 0, to: px.count, by: 4) { px.swapAt(p, p + 2) }   // BGRA -> RGBA
+        if let img = PixelArt.makeImage(px, width: 1440, height: 900) {
             try? NSBitmapImageRep(cgImage: img).representation(using: .png, properties: [:])?
                 .write(to: URL(fileURLWithPath: CommandLine.arguments[i + 1]))
         }

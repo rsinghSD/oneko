@@ -24,6 +24,13 @@ final class CrowdController {
     private let queue: MTLCommandQueue?
     private var step: MTLComputePipelineState?
     private var draw: MTLRenderPipelineState?
+    /// Second pass: the front of the box over cats napping in the heap.
+    private var drawFront: MTLRenderPipelineState?
+    private var frontTexture: MTLTexture?
+    /// The GPU box heap's boxes: crowd cats nap in the top ones.
+    private var heap: MTLBuffer?
+    private var heapCount = 0
+    private var lastCursor = CGPoint(x: -1, y: -1)
     private var buffers: [MTLBuffer] = []
     private var current = 0
     private var atlas: MTLTexture?
@@ -39,7 +46,8 @@ final class CrowdController {
     private struct Params {
         var cursor: SIMD2<Float>; var leader: SIMD2<Float>
         var count: UInt32; var tick: UInt32; var mode: UInt32; var paused: UInt32
-        var speed: Float; var halfSize: Float; var spread: SIMD2<Float>; var screenCount: UInt32; var pad: UInt32 = 0
+        var speed: Float; var halfSize: Float; var spread: SIMD2<Float>; var screenCount: UInt32; var heapCount: UInt32 = 0
+        var cursorMoved: UInt32 = 0; var pad: UInt32 = 0
         var screens: (SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>,
                       SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>)
     }
@@ -63,6 +71,10 @@ final class CrowdController {
             c.destinationRGBBlendFactor = .oneMinusSourceAlpha
             c.destinationAlphaBlendFactor = .oneMinusSourceAlpha
             draw = try device.makeRenderPipelineState(descriptor: d)
+            d.vertexFunction = lib.makeFunction(name: "crowd_front_vertex")
+            d.fragmentFunction = lib.makeFunction(name: "crowd_front_fragment")
+            drawFront = try device.makeRenderPipelineState(descriptor: d)
+            frontTexture = Self.texture(PixelArt.boxFront.image, device: device)
         } catch {
             FileHandle.standardError.write("Oneko: crowd mode unavailable: \(error)\n".data(using: .utf8)!)
         }
@@ -119,6 +131,28 @@ final class CrowdController {
         coatCount = sheets.count
     }
 
+    /// The heap's boxes (centres), so crowd cats can nap in them. Empty: no heap.
+    func setHeap(_ positions: [SIMD2<Float>]) {
+        heapCount = positions.count
+        guard let device, !positions.isEmpty else { heap = nil; return }
+        heap = positions.withUnsafeBytes { device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared) }
+    }
+
+    private static func texture(_ image: CGImage, device: MTLDevice) -> MTLTexture? {
+        let w = image.width, h = image.height
+        var px = [UInt8](repeating: 0, count: w * h * 4)
+        px.withUnsafeMutableBytes { raw in
+            CGContext(data: raw.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                      space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)?
+                .draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        }
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: w, height: h, mipmapped: false)
+        d.usage = .shaderRead
+        guard let t = device.makeTexture(descriptor: d) else { return nil }
+        px.withUnsafeBytes { t.replace(region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0, withBytes: $0.baseAddress!, bytesPerRow: w * 4) }
+        return t
+    }
+
     func setVisible(_ on: Bool) {
         visible = on
         if !on { for w in windows { w.orderOut(nil) } }
@@ -135,6 +169,10 @@ final class CrowdController {
     // MARK: - 10 Hz
 
     func tick(cursor: CGPoint, screens: [ScreenInfo], covered: [CGRect]) {
+        tickNumber &+= 1
+        // Asleep (paused, away, Reduce Motion): nobody moves and the snore frame only
+        // changes every 4th tick, so the GPU only has work then.
+        if paused && tickNumber % 4 != 0 && screens.map(\.frame) == frames { return }
         guard visible, isAvailable, count > 0, !inFlight, let queue, let cb = queue.makeCommandBuffer() else { return }
         syncWindows(screens.map(\.frame))
         encodeStep(cb, cursor: cursor, screens: screens.map(\.frame))
@@ -156,7 +194,6 @@ final class CrowdController {
     /// One 10 Hz step for every crowd cat.
     private func encodeStep(_ cb: MTLCommandBuffer, cursor: CGPoint, screens: [CGRect]) {
         guard let step, buffers.count == 2 else { return }
-        tickNumber &+= 1
         // Spread the crowd over a disc around the cursor: as dense as the first 50 cats, but
         // never much wider than all the displays together.
         let area = screens.reduce(0) { $0 + $1.width * $1.height }
@@ -172,18 +209,22 @@ final class CrowdController {
         for (i, s) in screens.prefix(8).enumerated() {
             rects[i] = SIMD4(Float(s.minX), Float(s.minY), Float(s.maxX), Float(s.maxY))
         }
+        let moved = hypot(cursor.x - lastCursor.x, cursor.y - lastCursor.y) > 3
+        lastCursor = cursor
         var p = Params(
             cursor: SIMD2(Float(cursor.x), Float(cursor.y)), leader: SIMD2(Float(leader.x), Float(leader.y)),
             count: UInt32(count), tick: tickNumber,
             mode: behavior == .swarm ? 0 : behavior == .conga ? 1 : 2, paused: paused ? 1 : 0,
             speed: Float(speed), halfSize: Float(16 * scale), spread: spread,
-            screenCount: UInt32(min(8, screens.count)),
+            screenCount: UInt32(min(8, screens.count)), heapCount: UInt32(heap == nil ? 0 : heapCount),
+            cursorMoved: moved ? 1 : 0,
             screens: (rects[0], rects[1], rects[2], rects[3], rects[4], rects[5], rects[6], rects[7]))
         guard let enc = cb.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(step)
         enc.setBuffer(buffers[current], offset: 0, index: 0)
         enc.setBuffer(buffers[1 - current], offset: 0, index: 1)
         enc.setBytes(&p, length: MemoryLayout<Params>.stride, index: 2)
+        enc.setBuffer(heap ?? buffers[current], offset: 0, index: 3)   // (unused without a heap)
         let w = step.threadExecutionWidth
         enc.dispatchThreadgroups(MTLSize(width: (count + w - 1) / w, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1))
@@ -207,7 +248,19 @@ final class CrowdController {
         enc.setVertexBytes(&dp, length: MemoryLayout<DrawParams>.stride, index: 1)
         enc.setFragmentTexture(atlas, index: 0)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: count * 6)
+        if heapCount > 0, let drawFront, let frontTexture {   // box fronts over the cats napping in the heap
+            enc.setRenderPipelineState(drawFront)
+            enc.setFragmentTexture(frontTexture, index: 0)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: count * 6)
+        }
         enc.endEncoding()
+    }
+
+    /// For `--selftest`: how many crowd cats are napping in heap boxes right now.
+    func heapNappers() -> Int {
+        guard buffers.count == 2 else { return 0 }
+        let cats = buffers[current].contents().bindMemory(to: Cat.self, capacity: count)
+        return (0..<count).filter { cats[$0].cell & 0x8000 != 0 }.count
     }
 
     /// The last self-check frame (BGRA, top row first), for `--crowd-png`.
@@ -220,6 +273,7 @@ final class CrowdController {
         setCoats(sheets)
         setCount(n, around: CGPoint(x: screen.minX + 50, y: screen.minY + 50))
         for _ in 0..<ticks {
+            tickNumber &+= 1
             guard let cb = queue.makeCommandBuffer() else { return nil }
             encodeStep(cb, cursor: cursor, screens: [screen])
             cb.commit()
@@ -261,7 +315,8 @@ final class CrowdController {
     struct Params {
         float2 cursor; float2 leader;
         uint count; uint tick; uint mode; uint paused;
-        float speed; float halfSize; float2 spread; uint screenCount; uint pad;
+        float speed; float halfSize; float2 spread; uint screenCount; uint heapCount;
+        uint cursorMoved; uint pad;
         float4 screens[8];
     };
     struct DrawParams { float2 origin; float2 size; float halfSize; uint coats; };
@@ -290,10 +345,40 @@ final class CrowdController {
         return out;
     }
 
+    // Cells with this bit set: napping in a heap box (drawn with the box front over it).
+    constant ushort inBox = 0x8000;
+
     kernel void crowd_step(const device Cat* src [[buffer(0)]], device Cat* dst [[buffer(1)]],
-                           constant Params& u [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+                           constant Params& u [[buffer(2)]], const device float2* heap [[buffer(3)]],
+                           uint i [[thread_position_in_grid]]) {
         if (i >= u.count) return;
         Cat c = src[i];
+        c.cell &= ~inBox;
+        // A third of the crowd likes the box heap: once it's sat still long enough, it goes
+        // and curls up in one of the top boxes, until you move the cursor.
+        uint nap = 40 + hash(c.seed) % 120;
+        if (u.heapCount > 0 && hash(c.seed * 3u) % 3u == 0u && u.paused == 0 && u.cursorMoved == 0 && c.idle >= nap) {
+            uint top = min(u.heapCount, 4096u);
+            float2 spot = heap[u.heapCount - 1 - hash(c.seed * 7u) % top];
+            float2 d = spot - c.pos;
+            float dist = length(d);
+            float speed = u.speed * (0.8 + 0.4 * unit(c.seed * 31u));
+            c.idle = min(c.idle + 1, 60000);
+            if (dist > speed) {
+                float2 dir = d / dist;
+                int ns = dir.y > 0.5 ? 0 : dir.y < -0.5 ? 2 : 1;
+                int ew = dir.x > 0.5 ? 0 : dir.x < -0.5 ? 2 : 1;
+                const int pick[3][3] = { {1, 0, 7}, {2, 0, 6}, {3, 4, 5} };
+                c.cell = runCells[pick[ns][ew]][(u.tick + c.seed) % 2];
+                c.pos += dir * speed;
+            } else {
+                c.pos = spot;
+                c.cell = ((u.tick / 4) % 2 == 0 ? sleepA : sleepB) | inBox;
+            }
+            dst[i] = c;
+            return;
+        }
+        if (u.cursorMoved != 0 && c.idle > 160 + 120) c.idle = 0;   // you're back: out of the box
         uint n = i + 50;                       // continues the first 50 cats' sunflower
         float2 target;
         if (u.mode == 1) {                     // conga: follow the one in front
@@ -348,9 +433,11 @@ final class CrowdController {
             o.pos = float4(-2, -2, 0, 1); o.uv = 0; o.coat = 0;
             return o;
         }
+        if ((c.cell & inBox) != 0) center.y += p.halfSize * 0.25;   // peeking out of the box
         float2 local = center + (corner * 2.0 - 1.0) * p.halfSize;
         o.pos = float4(local / p.size * 2.0 - 1.0, 0, 1);
-        float col = float(c.cell % 8), row = float(c.cell / 8);
+        ushort cell = c.cell & ~inBox;
+        float col = float(cell % 8), row = float(cell / 8);
         o.uv = float2((col + corner.x) * 32.0 / 256.0, (row + 1.0 - corner.y) * 32.0 / 128.0);
         o.coat = hash(c.seed * 13u) % max(p.coats, 1u);
         return o;
@@ -359,6 +446,32 @@ final class CrowdController {
     fragment float4 crowd_fragment(VOut in [[stage_in]], texture2d_array<float> atlas [[texture(0)]]) {
         constexpr sampler nearest(filter::nearest, address::clamp_to_edge);
         float4 c = atlas.sample(nearest, in.uv, in.coat);
+        if (c.a < 0.1) discard_fragment();
+        return c;
+    }
+
+    // The box front over a cat napping in the heap (only those cats; the rest are culled).
+    vertex VOut crowd_front_vertex(uint vid [[vertex_id]], const device Cat* cats [[buffer(0)]],
+                                   constant DrawParams& p [[buffer(1)]]) {
+        Cat c = cats[vid / 6];
+        uint k = vid % 6;
+        float2 corner = float2(k == 1 || k == 3 || k == 4 ? 1.0 : 0.0, k == 2 || k == 4 || k == 5 ? 1.0 : 0.0);
+        VOut o;
+        float2 center = floor(c.pos) - p.origin;
+        if ((c.cell & inBox) == 0 || any(center < -p.halfSize) || any(center > p.size + p.halfSize)) {
+            o.pos = float4(-2, -2, 0, 1); o.uv = 0; o.coat = 0;
+            return o;
+        }
+        float2 local = center + (corner * 2.0 - 1.0) * p.halfSize;
+        o.pos = float4(local / p.size * 2.0 - 1.0, 0, 1);
+        o.uv = float2(corner.x, 1.0 - corner.y);
+        o.coat = 0;
+        return o;
+    }
+
+    fragment float4 crowd_front_fragment(VOut in [[stage_in]], texture2d<float> art [[texture(0)]]) {
+        constexpr sampler nearest(filter::nearest, address::clamp_to_edge);
+        float4 c = art.sample(nearest, in.uv);
         if (c.a < 0.1) discard_fragment();
         return c;
     }

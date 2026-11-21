@@ -58,7 +58,7 @@ final class WelcomeWindow: NSPanel {
         setContentSize(stack.fittingSize)
     }
 
-    private static func tipRow(_ tip: (symbol: String, title: String, text: String)) -> NSView {
+    static func tipRow(_ tip: (symbol: String, title: String, text: String)) -> NSView {
         let icon = NSImageView()
         icon.image = NSImage(systemSymbolName: tip.symbol, accessibilityDescription: tip.title)
             ?? NSImage(systemSymbolName: "pawprint", accessibilityDescription: tip.title)
@@ -94,9 +94,95 @@ final class WelcomeWindow: NSPanel {
     }
 }
 
-/// A little bubble over a sleeping cat: "Double-click to wake".
+/// "What's New": shown once, on the first launch after an update (and from the menu).
+final class WhatsNewWindow: NSPanel {
+    /// The newest release first. Add an entry for every release.
+    static let releases: [(version: String, items: [(symbol: String, title: String, text: String)])] = [
+        // 0.6.0 is the first release since 0.5.5, so it sums up 0.5.7 and 0.5.8 too (only the
+        // newest entry is shown).
+        ("0.6.0", [
+            ("cloud.bolt.rain", "Your real weather", "Rain, thunderstorms (with thunder), snow or sunshine from where you are, falling behind your windows. Or pick seasonal weather, or none."),
+            ("figure.2", "Every toy for every cat", "Any cat naps in any box, fetches any bone and chases any yarn. Up to 50 bones and balls of yarn, and up to a million boxes. Boxes stack."),
+            ("heart.circle", "Cats play together", "They groom, play-fight and chase each other. The big box fits four, and they nap in it until you lift them out."),
+            ("fork.knife", "Hungry cats", "Every 20–40 minutes they head for a food bowl. Click a bowl to fill it up."),
+            ("tag", "Names and stats", "Hover a cat for its name and stats, and ⌥-click it to rename it. Oneko now checks for updates once a day."),
+            ("gauge.with.dots.needle.67percent", "About ten times lighter", "Thousands of cats cost a fraction of the CPU, and cats no longer glitch where two displays meet."),
+        ]),
+        ("0.5.8", [
+            ("figure.2", "Every toy for every cat", "The closest cat fetches a thrown bone, any cat chases the yarn, and the whole gang goes after the laser. Up to 50 bones and 50 balls of yarn."),
+            ("fork.knife", "Food bowls", "Cats get hungry: click a bowl to fill it."),
+            ("heart.circle", "Cats play together", "Cats sitting side by side groom each other, play-fight or chase each other. One big box fits four of them."),
+            ("square.stack.3d.up", "Stack the boxes", "Boxes pile up on each other, and in Toolbox mode cats hop up them. Crowd cats nap in the box heap."),
+            ("snowflake", "Names, stats and weather", "Hover a cat for its name and stats. Your real weather falls from the top of the screen: rain, thunder, snow or sun. Oneko now checks for updates once a day."),
+        ]),
+        ("0.5.7", [
+            ("shippingbox", "Boxes for everyone", "Every cat naps in any free box, not just the first cat. One cat per box."),
+            ("square.stack.3d.up", "Up to a million boxes", "Set how many under Settings › Toys. The first 50 are real boxes you can carry, throw and shut; the rest pile up in the corner of the screen."),
+            ("dock.rectangle", "Dock bonk", "If your Dock hides itself, it bonks cats and toys into the air when it pops up. Turn it off under Settings › Behavior."),
+            ("rectangle.bottomhalf.inset.filled", "Touch Bar trips for every cat", "Slam any cat down into the Touch Bar, and flick any cat on the bar back up to the desktop."),
+            ("gauge.with.dots.needle.33percent", "Lighter", "Lots of cats cost less: idle ones skip the 60 fps work, and a sleeping crowd barely touches the graphics chip."),
+        ]),
+    ]
+
+    static var currentVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+    }
+
+    init(icon: CGImage?) {
+        super.init(contentRect: NSRect(x: 0, y: 0, width: 420, height: 480),
+                   styleMask: [.titled, .closable, .fullSizeContentView], backing: .buffered, defer: false)
+        titleVisibility = .hidden
+        titlebarAppearsTransparent = true
+        isMovableByWindowBackground = true
+        isReleasedWhenClosed = false
+        level = .floating
+
+        let image = NSImageView()
+        if let icon { image.image = NSImage(cgImage: icon, size: NSSize(width: 64, height: 64)) }
+        image.imageScaling = .scaleProportionallyUpOrDown
+        image.widthAnchor.constraint(equalToConstant: 64).isActive = true
+        image.heightAnchor.constraint(equalToConstant: 64).isActive = true
+
+        let latest = Self.releases.first
+        let title = NSTextField(labelWithString: "What's New in Oneko \(latest?.version ?? Self.currentVersion)")
+        title.font = .systemFont(ofSize: 20, weight: .bold)
+        let sub = NSTextField(labelWithString: "Oneko just got an update. Here's what changed.")
+        sub.font = .systemFont(ofSize: 12)
+        sub.textColor = .secondaryLabelColor
+
+        let rows = NSStackView(views: (latest?.items ?? []).map(WelcomeWindow.tipRow))
+        rows.orientation = .vertical
+        rows.alignment = .leading
+        rows.spacing = 12
+
+        let go = NSButton(title: "Continue", target: nil, action: #selector(NSWindow.performClose(_:)))
+        go.bezelStyle = .rounded
+        go.keyEquivalent = "\r"
+        go.controlSize = .large
+
+        let stack = NSStackView(views: [image, title, sub, rows, go])
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 6
+        stack.setCustomSpacing(18, after: sub)
+        stack.setCustomSpacing(20, after: rows)
+        stack.edgeInsets = NSEdgeInsets(top: 34, left: 28, bottom: 22, right: 28)
+        contentView = stack
+        setContentSize(stack.fittingSize)
+    }
+
+    func present() {
+        center()
+        NSApp.activate(ignoringOtherApps: true)
+        makeKeyAndOrderFront(nil)
+    }
+}
+
+/// A little bubble over a cat you're hovering: its name and stats ("Double-click to wake"
+/// if it's asleep).
 final class HintWindow: OverlayPanel {
     private let label = NSTextField(labelWithString: "Double-click to wake")
+    private let bubble = NSView()
 
     override init() {
         super.init()
@@ -104,16 +190,21 @@ final class HintWindow: OverlayPanel {
         label.font = .systemFont(ofSize: 11, weight: .medium)
         label.textColor = .white
         label.alignment = .center
-        let bubble = NSView()
         bubble.wantsLayer = true
         bubble.layer?.backgroundColor = NSColor(white: 0.1, alpha: 0.85).cgColor
         bubble.layer?.cornerRadius = 9
+        bubble.addSubview(label)
+        mouseView.addSubview(bubble)
+        setText("Double-click to wake")
+    }
+
+    func setText(_ text: String) {
+        guard text != label.stringValue || bubble.frame.width == 0 else { return }
+        label.stringValue = text
         label.sizeToFit()
         let size = NSSize(width: label.frame.width + 18, height: 20)
         bubble.frame = NSRect(origin: .zero, size: size)
         label.frame = NSRect(x: 9, y: (size.height - label.frame.height) / 2, width: label.frame.width, height: label.frame.height)
-        bubble.addSubview(label)
-        mouseView.addSubview(bubble)
         setContentSize(size)
     }
 
