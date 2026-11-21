@@ -156,6 +156,22 @@ class SettingsPage: NSViewController {
         return b
     }
 
+    /// A number typed into `field` was applied: stop editing it, so the field shows the real
+    /// value from now on (a field being edited isn't refreshed, so it used to keep showing the
+    /// old number after the stepper or the menu changed it).
+    func typed(_ field: NSTextField, _ f: () -> Void) {
+        changed(f)
+        if field.currentEditor() != nil { field.window?.makeFirstResponder(nil) }
+        refresh()
+    }
+
+    /// The stepper beside `field` was clicked: throw away anything half-typed in the field,
+    /// so it shows what the stepper set.
+    func fromStepper(_ field: NSTextField, _ f: () -> Void) {
+        if field.currentEditor() != nil { field.abortEditing() }
+        changed(f)
+    }
+
     /// Run a change, then refresh every page (one setting can affect another).
     func changed(_ f: () -> Void) {
         f()
@@ -300,9 +316,12 @@ final class CatsPage: SettingsPage {
     }()
     private lazy var crowd = checkbox("Crowd mode: cats past 50 are light GPU cats", #selector(crowdChanged))
     private lazy var plays = checkbox("Cats play with each other", #selector(playsChanged))
+    private lazy var bumping = popup(Settings.Bumping.allCases.map(\.title), #selector(bumpingChanged))
     private lazy var behavior = popup(Settings.CatBehavior.allCases.map(\.title), #selector(behaviorChanged))
     private lazy var coats = popup(Settings.CoatMode.allCases.map(\.title), #selector(coatsChanged))
     private lazy var choose = button("Choose…", #selector(chooseCoats))
+    private lazy var eachCat = button("Names and Sizes…", #selector(showEachCat))
+    private var catList: CatListPanel?
     private let warning = NSTextField(wrappingLabelWithString: "")
     private var warningRow: NSGridRow?
     private var coatList: CoatListPanel?
@@ -325,7 +344,11 @@ final class CatsPage: SettingsPage {
         row("Extra cats", behavior)
         row("", plays)
         note("Cats sitting next to each other now and then groom each other, have a play-fight, or chase each other around.")
+        row("Bumping", bumping)
+        note("Cats bump into each other, and a cat you throw into another knocks it flying. Crazy: much harder knocks, bouncier mid-air bounces, more spin. Total Chaos: on top of that, cats running into each other launch each other like pinballs.")
         row("Coats", coats, choose)
+        row("Each cat", eachCat)
+        note("Give every cat a name of its own, and a size of its own for the first \(Settings.maxSizedCats) (1×, 2× or 3×).")
         if TouchBarCat.isSupported { note("The Touch Bar shows up to 50 cats.") }
     }
 
@@ -339,6 +362,7 @@ final class CatsPage: SettingsPage {
         stepper.integerValue = n
         crowd.state = s.crowdMode ? .on : .off
         plays.state = s.catsPlay ? .on : .off
+        bumping.selectItem(at: Settings.Bumping.allCases.firstIndex(of: s.bumping) ?? 2)
         behavior.selectItem(at: Settings.CatBehavior.allCases.firstIndex(of: s.catBehavior) ?? 0)
         coats.selectItem(at: Settings.CoatMode.allCases.firstIndex(of: s.coatMode) ?? 0)
         choose.isEnabled = s.coatMode == .custom && n >= 2
@@ -369,8 +393,8 @@ final class CatsPage: SettingsPage {
         return alert.runModal() == .alertFirstButtonReturn
     }
 
-    @objc private func countChanged() { setCount(count.integerValue) }
-    @objc private func stepped() { setCount(stepper.integerValue) }
+    @objc private func countChanged() { let n = count.integerValue; typed(count) { setCount(n) } }
+    @objc private func stepped() { let n = stepper.integerValue; fromStepper(count) { setCount(n) } }
     @objc private func crowdChanged() {
         changed {
             guard let app else { return }
@@ -383,6 +407,10 @@ final class CatsPage: SettingsPage {
         }
     }
     @objc private func playsChanged() { changed { app?.settings.catsPlay.toggle() } }
+    @objc private func bumpingChanged() {
+        let b = Settings.Bumping.allCases[bumping.indexOfSelectedItem]
+        changed { app?.setBumping(b) }
+    }
 
     @objc private func behaviorChanged() {
         changed {
@@ -395,6 +423,13 @@ final class CatsPage: SettingsPage {
             app?.settings.coatMode = Settings.CoatMode.allCases[coats.indexOfSelectedItem]
             app?.reloadSprites()
         }
+    }
+    @objc private func showEachCat() {
+        guard let app, let w = view.window else { return }
+        w.makeFirstResponder(nil)   // commit the cat count first
+        let panel = CatListPanel(app: app)
+        catList = panel
+        w.beginSheet(panel)
     }
     @objc private func chooseCoats() {
         guard let app, let w = view.window else { return }
@@ -469,6 +504,99 @@ final class CoatListPanel: NSPanel {
     }
 }
 
+/// A name for every cat (up to 50 here; ⌥-click any cat for the rest), and a size of its
+/// own for the first 10.
+final class CatListPanel: NSPanel {
+    private weak var app: AppDelegate?
+    private var fields: [NSTextField] = []
+    private static let sizeTitles = ["Size setting", "1×", "2×", "3×"]
+
+    init(app: AppDelegate) {
+        self.app = app
+        let width: CGFloat = 400, height: CGFloat = 440
+        super.init(contentRect: NSRect(x: 0, y: 0, width: width, height: height), styleMask: [.titled],
+                   backing: .buffered, defer: false)
+        title = "Names and Sizes"
+        let n = max(1, min(app.settings.realCatCount, 50))
+        let names = app.settings.catNames, sizes = app.settings.catSizes
+        let rows = NSStackView()
+        rows.orientation = .vertical
+        rows.alignment = .leading
+        rows.spacing = 6
+        for id in 0..<n {
+            let label = NSTextField(labelWithString: "Cat \(id + 1):")
+            label.alignment = .right
+            label.widthAnchor.constraint(equalToConstant: 56).isActive = true
+            let f = NSTextField()
+            f.placeholderString = CatNames.name(id)
+            f.stringValue = names[String(id)] ?? ""
+            f.tag = id
+            f.target = self
+            f.action = #selector(named(_:))
+            (f.cell as? NSTextFieldCell)?.sendsActionOnEndEditing = true
+            f.widthAnchor.constraint(equalToConstant: 170).isActive = true
+            fields.append(f)
+            var views: [NSView] = [label, f]
+            if id < Settings.maxSizedCats {
+                let p = NSPopUpButton()
+                p.addItems(withTitles: Self.sizeTitles)
+                p.selectItem(at: sizes[safe: id] ?? 0)
+                p.tag = id
+                p.target = self
+                p.action = #selector(sized(_:))
+                p.isEnabled = app.touchBar == nil
+                views.append(p)
+            }
+            let row = NSStackView(views: views)
+            row.spacing = 8
+            rows.addArrangedSubview(row)
+        }
+        if app.settings.realCatCount > 50 {
+            let more = NSTextField(labelWithString: "⌥-click any other cat to name it.")
+            more.textColor = .secondaryLabelColor
+            rows.addArrangedSubview(more)
+        }
+        rows.edgeInsets = NSEdgeInsets(top: 12, left: 16, bottom: 12, right: 16)
+        let doc = FlippedView()
+        rows.translatesAutoresizingMaskIntoConstraints = false
+        doc.addSubview(rows)
+        let fit = rows.fittingSize
+        doc.frame = NSRect(x: 0, y: 0, width: max(width - 20, fit.width), height: fit.height)
+        rows.frame = doc.bounds
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 44, width: width, height: height - 44))
+        scroll.hasVerticalScroller = true
+        scroll.documentView = doc
+        scroll.drawsBackground = false
+        let done = NSButton(title: "Done", target: self, action: #selector(finish))
+        done.bezelStyle = .rounded
+        done.keyEquivalent = "\r"
+        done.frame = NSRect(x: width - 96, y: 10, width: 80, height: 28)
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        content.addSubview(scroll)
+        content.addSubview(done)
+        contentView = content
+    }
+
+    @objc private func named(_ sender: NSTextField) {
+        guard let app else { return }
+        var names = app.settings.catNames
+        let n = sender.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        names[String(sender.tag)] = n.isEmpty ? nil : String(n.prefix(40))
+        app.settings.catNames = names
+    }
+
+    @objc private func sized(_ sender: NSPopUpButton) {
+        app?.setSize(ofCat: sender.tag, sender.indexOfSelectedItem)
+    }
+
+    @objc private func finish() {
+        makeFirstResponder(nil)                  // commit a name still being typed
+        for f in fields { named(f) }
+        (sheetParent as? SettingsWindow)?.refresh()
+        sheetParent?.endSheet(self)
+    }
+}
+
 private final class FlippedView: NSView {
     override var isFlipped: Bool { true }
 }
@@ -477,7 +605,10 @@ private final class FlippedView: NSView {
 
 final class NapsPage: SettingsPage {
     override var symbol: String { "moon.zzz" }
-    private lazy var naps = checkbox("Naps when left alone", #selector(napsChanged))
+    private lazy var naps = popup(["Never"] + Settings.Sleepiness.allCases.map(\.title), #selector(napsChanged))
+    private lazy var explores = checkbox("Explores on its own: climbs windows, strolls the menu bar", #selector(exploresChanged))
+    private lazy var scratches = checkbox("Scratches the edges of windows", #selector(scratchesChanged))
+    private lazy var dockFloor = popup(Settings.DockFloor.allCases.map(\.title), #selector(dockFloorChanged))
     private lazy var windows = checkbox("On window title bars", #selector(windowsChanged))
     private lazy var menuBar = checkbox("In the menu bar (1× size only)", #selector(menuBarChanged))
     private lazy var dock = checkbox("On top of the Dock", #selector(dockChanged))
@@ -495,25 +626,38 @@ final class NapsPage: SettingsPage {
     required init?(coder: NSCoder) { fatalError() }
 
     override func build() {
-        row("Naps", naps)
+        row("Sleepiness", naps)
+        note("How often the cats doze off and wander off for a nap. Up on the menu bar or a title bar, a wide-awake cat runs about; a sleepy one curls up there. Parked on the Dock, a window or the menu bar (or told to stay), only Often and Very Sleepy cats doze off; the rest sit there awake. Also in the menu bar menu.")
         row("Nap spots", windows)
         row("", menuBar)
         row("", dock)
+        gap()
+        row("Left alone", explores)
+        note("When you leave the mouse alone for a bit, a cat may climb up the side of a window and stroll along its title bar, walk round the inside of a window's border, or walk along the menu bar (1× only), and maybe nap there. Move the mouse and it comes running.")
+        row("", scratches)
         gap()
         row("Your Mac", reacts)
         note("Naps when you've been away for 2 minutes and stretches awake when you're back; a little sleepier late at night.")
         row("", fullScreen)
         row("", reduceMotion)
         gap()
-        row("Dock", dockBonk)
-        note("With the Dock set to hide, cats (and toys) sitting where it slides up get bonked into the air.")
+        row("Dock", dockFloor)
+        note("On top: cats stand on the Dock (following your cursor into it, they wait on top). On the ground: the Dock isn't there for them; they walk and land in front of it.")
+        row("", dockBonk)
+        note("Only with the Dock set to hide, and standing on top: cats (and toys) sitting where it slides up get bonked into the air. Off, they're lifted onto it instead.")
         row("Dock size", dockStatus, dockButton)
         note("Oneko works out how long the Dock is from its icons. With Accessibility access it reads the Dock's exact size instead (it never reads anything else).")
     }
 
     override func refresh() {
         guard let s = app?.settings else { return }
-        naps.state = s.naps ? .on : .off
+        naps.selectItem(at: s.naps ? (Settings.Sleepiness.allCases.firstIndex(of: s.sleepiness) ?? 1) + 1 : 0)
+        explores.state = s.explores ? .on : .off
+        explores.isEnabled = app?.touchBar == nil
+        scratches.state = s.scratchesWindows ? .on : .off
+        scratches.isEnabled = app?.touchBar == nil && s.explores
+        dockFloor.selectItem(at: Settings.DockFloor.allCases.firstIndex(of: s.dockFloor) ?? 0)
+        dockFloor.isEnabled = app?.touchBar == nil
         windows.state = s.spotWindows ? .on : .off
         menuBar.state = s.spotMenuBar ? .on : .off
         dock.state = s.spotDock ? .on : .off
@@ -523,7 +667,7 @@ final class NapsPage: SettingsPage {
         fullScreen.isEnabled = app?.touchBar == nil
         reduceMotion.state = s.ignoreReduceMotion ? .on : .off
         dockBonk.state = s.dockBonk ? .on : .off
-        dockBonk.isEnabled = app?.touchBar == nil
+        dockBonk.isEnabled = app?.touchBar == nil && s.dockFloor == .top
         let exact = WorldReader.exactDockAllowed
         dockStatus.stringValue = exact ? "Exact (Accessibility allowed)" : "Estimated from its icons"
         dockButton.isHidden = exact
@@ -531,7 +675,16 @@ final class NapsPage: SettingsPage {
 
     @objc private func dockExact() { WorldReader.askForExactDock() }
 
-    @objc private func napsChanged() { changed { app?.toggleNaps() } }
+    @objc private func napsChanged() {
+        let i = naps.indexOfSelectedItem
+        changed { app?.setSleepiness(i == 0 ? nil : Settings.Sleepiness.allCases[i - 1]) }
+    }
+    @objc private func exploresChanged() { changed { app?.toggleExplores() } }
+    @objc private func scratchesChanged() { changed { app?.toggleScratches() } }
+    @objc private func dockFloorChanged() {
+        let f = Settings.DockFloor.allCases[dockFloor.indexOfSelectedItem]
+        changed { app?.setDockFloor(f) }
+    }
     @objc private func windowsChanged() { changed { app?.toggleSpotWindows() } }
     @objc private func menuBarChanged() { changed { app?.toggleSpotMenuBar() } }
     @objc private func dockChanged() { changed { app?.toggleSpotDock() } }
@@ -576,7 +729,7 @@ final class ToysPage: SettingsPage {
     private lazy var bigBox = checkbox("Make the first box a big one (fits 4 cats)", #selector(bigBoxChanged))
     private lazy var boneCount = countField(max: Settings.maxBones, #selector(boneCountChanged))
     private lazy var boneStepper = stepper(max: Settings.maxBones, #selector(boneStepped))
-    private lazy var boneLabel = NSTextField(labelWithString: "bones (throw one to play fetch)")
+    private lazy var boneLabel = NSTextField(labelWithString: "fish bones (throw one to play fetch)")
     private lazy var yarnCount = countField(max: Settings.maxYarns, #selector(yarnCountChanged))
     private lazy var yarnStepper = stepper(max: Settings.maxYarns, #selector(yarnStepped))
     private lazy var yarnLabel = NSTextField(labelWithString: "balls of yarn")
@@ -598,9 +751,9 @@ final class ToysPage: SettingsPage {
         note("Every cat naps in any free box. The first 50 are real boxes you can carry, throw and shut; the rest pile up in the corner of the screen (drawn by the graphics chip, up to 1,000,000).")
         row("", boneCount, boneStepper, boneLabel)
         row("", yarnCount, yarnStepper, yarnLabel)
-        note("Every cat plays with every toy: the closest cat fetches a thrown bone, and any cat chases a rolling ball.")
+        note("Every cat plays with every toy: the closest cat fetches a thrown fish bone, and any cat chases a rolling ball.")
         row("", bowlCount, bowlStepper, NSTextField(labelWithString: "food bowls"))
-        note("Cats get hungry every 20–40 minutes; click a bowl to fill it up.")
+        note("Cats get hungry every 20–40 minutes. Click a bowl to fill it up and call every cat over to eat, hungry or not.")
         row("", laser)
         gap()
         row("Mode", toolbox)
@@ -621,7 +774,7 @@ final class ToysPage: SettingsPage {
         let bones = app.touchBar.map { $0.hasBone ? 1 : 0 } ?? app.settings.boneCount
         if boneCount.currentEditor() == nil { boneCount.integerValue = bones }
         boneStepper.integerValue = bones
-        boneLabel.stringValue = bones == 1 ? "bone (throw it to play fetch)" : "bones (throw one to play fetch)"
+        boneLabel.stringValue = bones == 1 ? "fish bone (throw it to play fetch)" : "fish bones (throw one to play fetch)"
         if yarnCount.currentEditor() == nil { yarnCount.integerValue = app.settings.yarnCount }
         yarnStepper.integerValue = app.settings.yarnCount
         yarnLabel.stringValue = app.settings.yarnCount == 1 ? "ball of yarn" : "balls of yarn"
@@ -634,15 +787,15 @@ final class ToysPage: SettingsPage {
         }
     }
 
-    @objc private func boxCountChanged() { changed { app?.setBoxCount(boxCount.integerValue) } }
-    @objc private func boxStepped() { changed { app?.setBoxCount(boxStepper.integerValue) } }
+    @objc private func boxCountChanged() { let n = boxCount.integerValue; typed(boxCount) { app?.setBoxCount(n) } }
+    @objc private func boxStepped() { let n = boxStepper.integerValue; fromStepper(boxCount) { app?.setBoxCount(n) } }
     @objc private func bigBoxChanged() { changed { app?.toggleBigBox() } }
-    @objc private func boneCountChanged() { changed { app?.setBoneCount(boneCount.integerValue) } }
-    @objc private func boneStepped() { changed { app?.setBoneCount(boneStepper.integerValue) } }
-    @objc private func yarnCountChanged() { changed { app?.setYarnCount(yarnCount.integerValue) } }
-    @objc private func yarnStepped() { changed { app?.setYarnCount(yarnStepper.integerValue) } }
-    @objc private func bowlCountChanged() { changed { app?.setBowlCount(bowlCount.integerValue) } }
-    @objc private func bowlStepped() { changed { app?.setBowlCount(bowlStepper.integerValue) } }
+    @objc private func boneCountChanged() { let n = boneCount.integerValue; typed(boneCount) { app?.setBoneCount(n) } }
+    @objc private func boneStepped() { let n = boneStepper.integerValue; fromStepper(boneCount) { app?.setBoneCount(n) } }
+    @objc private func yarnCountChanged() { let n = yarnCount.integerValue; typed(yarnCount) { app?.setYarnCount(n) } }
+    @objc private func yarnStepped() { let n = yarnStepper.integerValue; fromStepper(yarnCount) { app?.setYarnCount(n) } }
+    @objc private func bowlCountChanged() { let n = bowlCount.integerValue; typed(bowlCount) { app?.setBowlCount(n) } }
+    @objc private func bowlStepped() { let n = bowlStepper.integerValue; fromStepper(bowlCount) { app?.setBowlCount(n) } }
     @objc private func laserChanged() { changed { app?.toggleLaser() } }
     @objc private func toolboxChanged() { changed { app?.toggleToolbox() } }
     @objc private func catnipPressed() { app?.giveCatnip() }
@@ -682,7 +835,7 @@ final class SoundsPage: SettingsPage {
         let stack = NSStackView(views: previews)
         stack.spacing = 4
         row("Listen", stack)
-        note("All sounds are made by the app itself; there's nothing to download.")
+        note("The meow is a real recording that comes with the app; the other sounds are made by the app itself. There's nothing to download.")
     }
 
     override func refresh() {

@@ -209,15 +209,25 @@ enum Bench {
             _ = cats[i].drainEvents()
             _ = Playground.pose(&cats[i])   // in place, like the app's ExtraCat.pose
         }
+        if t % CatCollisions.separateEvery(cats.count) == 0 { separate(&cats) }
     }
 
     static func frame(_ cats: inout [Playground], _ t: Int, onlyMoving: Bool) {
         let w = world(t)
+        var flyers: [Int] = []
         for i in cats.indices where !onlyMoving || Playground.needsPhysics(&cats[i]) || i == 0 {
             cats[i].physics(dt: 1.0 / 60, world: w)
             _ = cats[i].drainEvents()
             _ = Playground.pose(&cats[i])   // in place, like the app's ExtraCat.pose
+            if Playground.body(&cats[i]).kind == .flying { flyers.append(i) }
         }
+        // Thrown cats knocking into each other, like the app.
+        _ = CatCollisions.bump(flyers: flyers, count: cats.count, skipFirst: false) { k, f in f(&cats[k]) }
+    }
+
+    /// Cats pushed apart where they've walked into each other, like the app's tick.
+    static func separate(_ cats: inout [Playground]) {
+        CatCollisions.separate(count: cats.count, skipFirst: false, swarmSpacing: 30) { k, f in f(&cats[k]) }
     }
 
 

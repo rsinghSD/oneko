@@ -241,7 +241,7 @@ final class TouchBarCat: NSObject, NSTouchBarDelegate {
 
     /// 10 Hz. The cursor's position across all displays maps onto the bar; a tap on an
     /// empty part of the bar sends Neko there for a few seconds instead.
-    func tick10(cursor: CGPoint, screens: [CGRect], speed: CGFloat, naps: Bool, paused: Bool) {
+    func tick10(cursor: CGPoint, screens: [CGRect], speed: CGFloat, naps: Bool, sleepiness: CGFloat = 1, paused: Bool) {
         guard isShowing else { return }
         let (minX, w) = span
         let union = screens.reduce(CGRect.null) { $0.union($1) }
@@ -251,6 +251,7 @@ final class TouchBarCat: NSObject, NSTouchBarDelegate {
         }
         play.cat.speed = speed
         play.cat.sleepEnabled = naps
+        if play.sleepiness != sleepiness { play.sleepiness = sleepiness }
         play.paused = paused || noCat
         world = Self.world(minX: minX, width: w, cursor: CGPoint(x: x, y: 13))
         play.keepInside(minX...(minX + w))     // nothing gets lost off the ends of the bar
@@ -258,6 +259,7 @@ final class TouchBarCat: NSObject, NSTouchBarDelegate {
         for i in extras.indices {
             extras[i].cat.speed = speed * (1 + 0.08 * CGFloat(i % 8 + 1))
             extras[i].cat.sleepEnabled = naps
+            if extras[i].sleepiness != sleepiness { extras[i].sleepiness = sleepiness }
             extras[i].paused = paused
             let tx = min(max(target(of: i, main: x), minX + 16), minX + w - 16)
             extras[i].keepInside(minX...(minX + w))

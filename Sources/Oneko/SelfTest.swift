@@ -42,7 +42,7 @@ enum SelfTest {
 
         // 4. Near the right edge, wall scratching becomes possible.
         var w = NekoBrain(position: CGPoint(x: 1430, y: 500))
-        var wrolls = [0, 2]  // choices = [sleeping, scratchSelf, scratchWallE]
+        var wrolls = [0, 999, 1]  // start; no doze; choices = [scratchSelf, scratchWallE]
         w.random = { _ in wrolls.isEmpty ? 1 : wrolls.removeFirst() }
         for _ in 0..<12 { w.tick(cursor: CGPoint(x: 1430, y: 500), screens: [screen]) }
         check(w.sprite == .scratchWallE, "scratches the east wall at the right edge (got \(w.sprite))")
@@ -90,6 +90,18 @@ enum SelfTest {
         let s2 = Settings(defaults: defaults)
         check(s2.speed == .zoomies && s2.size == .large && !s2.naps && s2.lastPosition == CGPoint(x: 12, y: 34),
               "settings and last position survive a relaunch")
+        // 0.6.5: sleepiness, the Dock, exploring, sizes per cat.
+        let s3 = Settings(defaults: defaults)
+        defaults.removeObject(forKey: "sleepiness"); defaults.removeObject(forKey: "catSizes")
+        check(s3.sleepiness == .sometimes && s3.sleepiness.factor < 1, "cats sleep less than classic oneko by default (Now and Then)")
+        check(s3.dockFloor == .top && s3.explores, "defaults: cats stand on top of the Dock, and explore on their own")
+        s3.size = .medium
+        s3.catSizes = [0, 3, 1] + Array(repeating: 2, count: 20)
+        check(s3.size(ofCat: 0) == 2 && s3.size(ofCat: 1) == 3 && s3.size(ofCat: 2) == 1 && s3.size(ofCat: 9) == 2
+              && s3.size(ofCat: 10) == 2 && s3.catSizes.count == Settings.maxSizedCats,
+              "the first 10 cats can each have a size of their own; the rest use the Size setting")
+        s3.size = .large
+        check(s3.size(ofCat: 0) == 3 && s3.size(ofCat: 2) == 1 && s3.size(ofCat: 10) == 3, "...and keep it when the Size setting changes")
         UserDefaults().removePersistentDomain(forName: suite)
 
         check(Settings.Speed.zoomies.rawValue == 2 * 24, "zoomies is twice as fast as before (48 pt/tick)")
@@ -333,23 +345,22 @@ extension SelfTest {
         n.mouseUp(at: CGPoint(x: 646, y: 400), time: bt + 0.005)
         check(n.bone.state == .flying && abs(twirl) > 5 && n.bone.body.spin == twirl, "a thrown bone keeps its twirl (\(Int(twirl)) rad/s)")
 
-        // O. The Dock isn't a floor: walk into it and get yeeted out, landing on top of it.
+        // O. 0.6.5: following your cursor into the Dock, it stands on top of the Dock and waits
+        // there. It's never yeeted up out of it (that used to happen even with the bonk off).
         var o = Playground(position: CGPoint(x: 500, y: 90))
         quiet(&o)
+        o.spotMenuBar = false; o.spotDock = false; o.spotWindows = false
         var docked = scr
         docked.dock = CGRect(x: 0, y: 0, width: 1440, height: 60)
         let wo = World(screens: [docked], windows: [], cursor: CGPoint(x: 500, y: 20))
-        var yeeted = false
-        for _ in 0..<20 where !yeeted {
-            o.tick10(world: wo)
-            if o.mode == .flying { yeeted = o.catBody.vel.dy > 1000 }
-        }
-        check(yeeted, "walking into the Dock yeets the cat up and out")
-        for _ in 0..<600 {
+        var oFlew = false
+        for i in 0..<360 {
             o.physics(dt: 1.0 / 60, world: wo)
-            if case .landing = o.mode { break }
+            if i % 6 == 0 { o.tick10(world: wo) }
+            if o.mode == .flying { oFlew = true }
         }
-        check(abs(o.cat.position.y - (60 + 16 - 3)) < 0.5, "...and it lands on top of the Dock (y=\(Int(o.cat.position.y)))")
+        check(!oFlew && !o.drainEvents().contains(.dockYeet), "following your cursor into the Dock never yeets the cat")
+        check(abs(o.cat.position.y - (60 + 16 - 3)) < 0.5, "...it waits on top of the Dock (y=\(Int(o.cat.position.y)))")
         // ...but a cat on top of the Dock chasing a low cursor only dips its feet: no yeet,
         // it's nudged back on top.
         var dip = Playground(position: CGPoint(x: 500, y: 73))
@@ -391,40 +402,53 @@ extension SelfTest {
         first.mouseUp(at: first.cat.position, time: 0.05, clickCount: 2)
         first.tick10(world: World(screens: [docked], windows: [], cursor: .zero))
         check(first.mode != .flying, "...and never on the first tick after launch")
-        // After a Dock yeet there's a grace period: no yeet loop.
-        var loop = Playground(position: CGPoint(x: 500, y: 30))
-        quiet(&loop)
-        loop.spotMenuBar = false; loop.spotDock = false; loop.spotWindows = false
-        loop.tick10(world: wo)
-        loop.tick10(world: wo)
-        var starts: [Int] = [], wasFlying = false
-        for i in 0..<360 {
-            loop.physics(dt: 1.0 / 60, world: wo)
-            if i % 6 == 0 { loop.tick10(world: wo) }
-            let f = loop.mode == .flying
-            if f && !wasFlying { starts.append(i) }
-            wasFlying = f
+        // Bonk off: nothing launches it off the Dock. Not following a cursor along the Dock
+        // and down into it, not the Dock popping up under it while it walks, not sitting
+        // above a cursor that dips into the Dock.
+        var calm = Playground(position: CGPoint(x: 200, y: 73))
+        quiet(&calm)
+        calm.dockBonk = false
+        calm.spotMenuBar = false; calm.spotDock = false; calm.spotWindows = false
+        var calmFlew = false
+        let cursors = [CGPoint(x: 900, y: 30), CGPoint(x: 520, y: 120), CGPoint(x: 520, y: 30), CGPoint(x: 100, y: 5)]
+        for i in 0..<1200 {
+            let c = cursors[(i / 300) % cursors.count]
+            let screen = (i / 50) % 2 == 0 ? docked : scr     // an auto-hiding Dock, in and out
+            let w = World(screens: [screen], windows: [], cursor: c)
+            calm.physics(dt: 1.0 / 60, world: w)
+            if i % 6 == 0 { calm.tick10(world: w) }
+            if calm.mode == .flying, calm.catBody.vel.dy > 0 { calmFlew = true }
         }
-        let gaps = zip(starts, starts.dropFirst()).map { $1 - $0 }
-        check(gaps.allSatisfy { $0 >= 120 }, "Dock yeets are always at least 2 s apart (\(starts.count) in 6 s)")
+        let calmEvents = calm.drainEvents()
+        check(!calmFlew && !calmEvents.contains(.dockYeet) && !calmEvents.contains(.dockBonk),
+              "Dock bonk off: the Dock never launches the cat, whatever your cursor and the Dock do")
 
-        // Leading it along the Dock top towards a cursor in the Dock yeets it (small dips count).
-        var lead = Playground(position: CGPoint(x: 200, y: 73))
-        quiet(&lead)
-        lead.spotMenuBar = false; lead.spotDock = false; lead.spotWindows = false
-        let wlead = World(screens: [docked], windows: [], cursor: CGPoint(x: 900, y: 30))
-        lead.tick10(world: wlead)
-        var led = false
-        for _ in 0..<80 where !led { lead.tick10(world: wlead); led = lead.mode == .flying }
-        check(led, "following a cursor that's down in the Dock, it gets yeeted")
-
-        // Sitting on the Dock right above a cursor that goes into the Dock: yeeted at once.
-        var above = Playground(position: CGPoint(x: 500, y: 73))
-        quiet(&above)
-        above.spotMenuBar = false; above.spotDock = false; above.spotWindows = false
-        above.tick10(world: World(screens: [docked], windows: [], cursor: CGPoint(x: 520, y: 120)))
-        above.tick10(world: World(screens: [docked], windows: [], cursor: CGPoint(x: 520, y: 30)))
-        check(above.mode == .flying, "a cat waiting on the Dock is yeeted as soon as your cursor goes into the Dock")
+        // Dock on the ground: the Dock isn't there for the cats. It walks right down to a
+        // cursor in front of the Dock and lands on the real bottom of the screen.
+        var gnd = Playground(position: CGPoint(x: 500, y: 300))
+        quiet(&gnd)
+        gnd.spotMenuBar = false; gnd.spotDock = false; gnd.spotWindows = false
+        let wg = World(screens: [docked], windows: [], cursor: CGPoint(x: 500, y: 20)).ignoringDock()
+        check(wg.screens[0].dock == nil && wg.screens[0].visible.minY == 0, "Dock on the ground: the floor is the bottom of the screen")
+        var gndFlew = false
+        for _ in 0..<80 { gnd.tick10(world: wg); if gnd.mode == .flying { gndFlew = true } }
+        check(!gndFlew && gnd.cat.position.y < 72, "...the cat walks down in front of the Dock (y=\(Int(gnd.cat.position.y)))")
+        var gdrop = Playground(position: CGPoint(x: 500, y: 400))
+        quiet(&gdrop)
+        gdrop.launch(at: CGPoint(x: 500, y: 400), velocity: CGVector(dx: 0, dy: -100))
+        for _ in 0..<600 { gdrop.physics(dt: 1.0 / 60, world: wg); if case .landing = gdrop.mode { break } }
+        check(abs(gdrop.cat.position.y - 13) < 0.5, "...and a dropped cat lands on the real bottom (y=\(Int(gdrop.cat.position.y)))")
+        // A slam still counts for the Touch Bar trip: it lands on the floor (no window) hard.
+        var slam = Playground(position: CGPoint(x: 500, y: 600))
+        quiet(&slam)
+        slam.launch(at: CGPoint(x: 500, y: 600), velocity: CGVector(dx: 0, dy: -3000))
+        var slamImpact: CGFloat = 0, slamWin: Int? = -1
+        for _ in 0..<120 {
+            slam.physics(dt: 1.0 / 60, world: wg)
+            for e in slam.drainEvents() { if case .landed(let imp, let win, _) = e, slamImpact == 0 { slamImpact = imp; slamWin = win } }
+        }
+        check(slamWin == nil && slamImpact >= AppDelegate.touchBarDropImpact,
+              "...and slamming it down still drops it into the Touch Bar (impact \(Int(slamImpact)))")
 
         // Auto-hide: a cat parked on the Dock falls when the Dock hides.
         var hide = Playground(position: CGPoint(x: 500, y: 73))
@@ -958,6 +982,350 @@ extension SelfTest {
         var far: CGFloat = 0
         for _ in 0..<30 { c.tick10(world: world(CGPoint(x: 600, y: 400))); far = max(far, hypot(c.cat.position.x - start.x, c.cat.position.y - start.y)) }
         check({ if case .zoomies = c.mode { return true }; return false }() && far > 100, "catnip sets off the zoomies (\(Int(far)) pt of running)")
+        // 0.6.5: twice as fast as before (6× a normal chase, it was 3×).
+        var nip = make(CGPoint(x: 900, y: 600))
+        nip.tick10(world: world(CGPoint(x: 900, y: 600)))
+        nip.giveCatnip()
+        let n0 = nip.cat.position
+        nip.tick10(world: world(CGPoint(x: 900, y: 600)))
+        let nipStep = hypot(nip.cat.position.x - n0.x, nip.cat.position.y - n0.y)
+        check(Playground.catnipSpeed == 6 && abs(nipStep - 6 * nip.cat.speed) < 0.5,
+              "catnip zoomies run twice as fast as before (\(Int(nipStep)) pt a tick)")
+
+        // Dinner on demand: click a bowl and every cat comes to eat, hungry or not.
+        var din = make(CGPoint(x: 900, y: 500))
+        din.placeBowl(at: CGPoint(x: 400, y: 63.5), falling: false)
+        din.toys.bowls[0].food = 2
+        din.tick10(world: world(CGPoint(x: 900, y: 500)))
+        check(!din.isHungry && din.mode == .chasing, "(a cat that isn't hungry)")
+        din.mouseDown(on: .bowl, at: CGPoint(x: 400, y: 63.5), time: 0, index: 0)
+        din.mouseUp(at: CGPoint(x: 400, y: 63.5), time: 0.05)
+        check(din.drainEvents().contains(.dinnerBell) && din.toys.bowls[0].food == ToyPile.Bowl.full,
+              "clicking a bowl fills it and rings the dinner bell")
+        din.callToDinner()
+        var ate = false, bubble = false
+        for _ in 0..<200 where !ate {
+            din.tick10(world: world(CGPoint(x: 900, y: 500)))
+            bubble = bubble || din.catPose.eating
+            ate = din.drainEvents().contains(.ate)
+        }
+        check(ate, "...and the cat comes and eats, even though it wasn't hungry")
+        check(bubble && !din.catPose.eating, "a little fish bobs over a cat while it eats (and goes when it's done)")
+        check(din.toys.bowls[0].finished && !din.usesBowl(0), "...and its bowl is done with, to be cleared away")
+        var shift = make(CGPoint(x: 900, y: 500))
+        for k in 0..<3 { shift.placeBowl(at: CGPoint(x: 300 + CGFloat(k) * 100, y: 63.5), falling: false, index: k) }
+        shift.makeHungry()
+        shift.tick10(world: world(CGPoint(x: 900, y: 500)))
+        let headed: Int? = { if case .goingToBowl(let j) = shift.mode { return j }; return nil }()
+        shift.bowlRemoved(0)
+        let now: Int? = { if case .goingToBowl(let j) = shift.mode { return j }; return nil }()
+        check(headed == 2 && now == 1, "...and a cat heading for a later bowl still heads for the same one")
+        var sleeper = make(CGPoint(x: 900, y: 500))
+        sleeper.placeBowl(at: CGPoint(x: 400, y: 63.5), falling: false)
+        sleeper.mouseDown(on: .cat, at: sleeper.cat.position, time: 0)
+        sleeper.mouseUp(at: sleeper.cat.position, time: 0.05, clickCount: 2)   // stay
+        sleeper.callToDinner()
+        sleeper.tick10(world: world(CGPoint(x: 900, y: 500)))
+        check({ if case .goingToBowl = sleeper.mode { return true }; return false }(), "...a cat dozing in place gets up for dinner too")
+
+        // Sleepiness: the same idle moment ends in a doze for a sleepy cat, not a wide-awake one.
+        func dozes(_ k: CGFloat) -> Bool {
+            var b = NekoBrain(position: CGPoint(x: 600, y: 400))
+            b.sleepiness = k
+            b.random = { n in n == 1000 ? 200 : 0 }
+            var seen = false
+            for _ in 0..<20 { b.tick(cursor: CGPoint(x: 600, y: 400), screens: [scr.frame]); seen = seen || b.sprite == .tired }
+            return seen
+        }
+        check(dozes(1) && dozes(2) && !dozes(0.25), "sleepiness: a sleepier cat dozes off more readily")
+        var nap1 = make(CGPoint(x: 600, y: 400)), nap2 = make(CGPoint(x: 600, y: 400))
+        nap1.sleepiness = 0.25; nap2.sleepiness = 2
+        check(nap1.cat.sleepiness == 0.25 && nap2.cat.sleepiness == 2, "...set on the cat's brain too")
+
+        // Exploring: left alone, it climbs up the side of a window, strolls along its title
+        // bar, and naps up there.
+        func explorer(_ at: CGPoint) -> Playground {
+            var p = make(at)
+            p.random = { _ in 0 }        // every whim, at once
+            p.explores = true
+            return p
+        }
+        let win = WindowInfo(id: 7, pid: 1, frame: CGRect(x: 300, y: 200, width: 600, height: 400))
+        let still = CGPoint(x: 200, y: 300)
+        let ww = World(screens: [scr], windows: [win], cursor: still)
+        var ex = explorer(still)
+        var climbed = false, strolled = false, napped = false
+        for _ in 0..<400 {
+            ex.tick10(world: ww)
+            if case .exploring(let o) = ex.mode {
+                if o.stage == .climb, ex.cat.sprite == .scratchWallE, abs(ex.cat.position.x - 287) < 0.5 { climbed = true }
+                if o.stage == .stroll, abs(ex.cat.position.y - 613) < 0.5,
+                   ex.cat.position.x >= 300, ex.cat.position.x <= 900 { strolled = true }
+            }
+            if case .napping(let spot, _) = ex.mode, spot.kind == .window(7) { napped = true; break }
+        }
+        check(climbed, "exploring: it climbs up the side of a window, paws on the edge")
+        check(strolled, "...strolls along the window's title bar")
+        check(napped, "...and naps up there")
+        // Move the mouse and it comes running.
+        var ex2 = explorer(still)
+        for _ in 0..<60 { ex2.tick10(world: ww) }
+        let wasOut: Bool = { if case .exploring = ex2.mode { return true }; return false }()
+        ex2.tick10(world: World(screens: [scr], windows: [win], cursor: CGPoint(x: 1200, y: 700)))
+        let back: Bool = { switch ex2.mode { case .chasing, .flying: return true; default: return false } }()
+        check(wasOut && back, "...and drops it to come running when you move the mouse")
+        // No windows: a stroll along the menu bar.
+        var mbx = explorer(CGPoint(x: 700, y: 400))
+        var onMenuBar = false
+        for _ in 0..<300 where !onMenuBar {
+            mbx.tick10(world: World(screens: [scr], windows: [], cursor: CGPoint(x: 700, y: 400)))
+            if case .exploring(let o) = mbx.mode, o.place == .menuBar, o.stage == .stroll,
+               abs(mbx.cat.position.y - 887) < 0.5 { onMenuBar = true }
+        }
+        check(onMenuBar, "exploring: it walks along the menu bar")
+        // Scratching post: it scratches the window's edge before it climbs.
+        var scr1 = explorer(still)
+        scr1.scratchesWindows = true
+        var scratchedEdge = false, scratchPose = false
+        for _ in 0..<300 where !scratchedEdge {
+            scr1.tick10(world: ww)
+            if case .exploring(let o) = scr1.mode, o.stage == .scratch, scr1.cat.sprite == .scratchWallE { scratchPose = true }
+            scratchedEdge = scr1.drainEvents().contains(.scratched)
+        }
+        check(scratchPose && scratchedEdge, "exploring: it gives a window's edge a good scratch (with Scratches Windows on)")
+        // Round the inside of a window's border: along the bottom edge, a scratch in the
+        // corner, up the side and along under the title bar.
+        let tall = WindowInfo(id: 9, pid: 1, frame: CGRect(x: 200, y: 100, width: 800, height: 760))
+        let wt = World(screens: [scr], windows: [tall], cursor: CGPoint(x: 600, y: 400))
+        var inn = make(CGPoint(x: 600, y: 400))
+        inn.explores = true
+        inn.scratchesWindows = true
+        inn.random = { n in n == 300 || n == 3 ? 0 : min(1, n - 1) }
+        var bottom = false, side = false, top = false, cornerScratch = false, wentInside = false
+        for _ in 0..<3000 {
+            inn.tick10(world: wt)
+            if case .exploring(let o) = inn.mode, o.place == .inside(9) {
+                wentInside = true
+                let p = inn.cat.position
+                if o.stage == .stroll, abs(p.y - 113) < 0.5, p.x > 212, p.x < 988 { bottom = true }
+                if abs(p.x - 213) < 0.5 || abs(p.x - 987) < 0.5, p.y > 200, p.y < 800,
+                   [.scratchWallW, .scratchWallE].contains(inn.cat.sprite) { side = true }
+                if abs(p.y - (860 - 28 - 16)) < 0.5 { top = true }
+            }
+            if inn.drainEvents().contains(.scratched) { cornerScratch = true }
+            if top && cornerScratch { break }
+        }
+        check(wentInside && bottom, "exploring: it walks along the inside of a window's bottom edge")
+        check(cornerScratch, "...scratches the corner")
+        check(side && top, "...and climbs up the inside of the border and along under the title bar")
+        // Sleepiness decides what it does up there: a wide-awake cat runs about on the menu
+        // bar, a very sleepy one curls up for a nap.
+        func menuBarDay(_ k: CGFloat) -> (napped: Bool, ran: CGFloat) {
+            var c = make(CGPoint(x: 700, y: 400))
+            c.explores = true
+            c.sleepiness = k
+            c.random = { n in n == 100 ? 50 : 0 }   // a middling roll for every "nap or not?"
+            var ran: CGFloat = 0, last: CGPoint?
+            for _ in 0..<1500 {
+                c.tick10(world: World(screens: [scr], windows: [], cursor: CGPoint(x: 700, y: 400)))
+                if case .exploring(let o) = c.mode, o.place == .menuBar, o.stage == .stroll {
+                    if let l = last { ran += abs(c.cat.position.x - l.x) }
+                    last = c.cat.position
+                } else { last = nil }
+                if case .napping(let spot, _) = c.mode, spot.kind == .menuBar { return (true, ran) }
+            }
+            return (false, ran)
+        }
+        let awake = menuBarDay(0.25), drowsy = menuBarDay(2)
+        check(!awake.napped && awake.ran > 400, "sleepiness Rarely: it runs around the menu bar instead of napping (\(Int(awake.ran)) pt)")
+        check(drowsy.napped, "...Very Sleepy: it naps up there")
+        func headsUp(_ k: CGFloat) -> CatMode {
+            var c = make(CGPoint(x: 700, y: 400))
+            c.explores = true
+            c.spotMenuBar = true
+            c.sleepiness = k
+            c.random = { n in n == 100 ? 50 : 0 }
+            for _ in 0..<60 {
+                c.tick10(world: World(screens: [scr], windows: [], cursor: CGPoint(x: 700, y: 400)))
+                if c.mode != .chasing { break }
+            }
+            return c.mode
+        }
+        check({ if case .exploring = headsUp(0.25) { return true }; return false }()
+              && { if case .goingToSpot = headsUp(2) { return true }; return false }(),
+              "...off to the menu bar: a wide-awake cat goes up to run about, a sleepy one to nap")
+        // Not sleepy: parked (or told to stay) it sits there awake. Sleepy: it dozes off.
+        func parked(_ k: CGFloat) -> Playground {
+            var c = make(CGPoint(x: 600, y: 400))
+            c.sleepiness = k
+            c.mouseDown(on: .cat, at: c.cat.position, time: 0)
+            c.mouseUp(at: c.cat.position, time: 0.05, clickCount: 2)   // stay
+            for _ in 0..<200 { c.tick10(world: world(CGPoint(x: 600, y: 400))) }
+            return c
+        }
+        let awakeP = parked(0.5), sleepyP = parked(2)
+        check(awakeP.isStaying && !awakeP.isSleeping && awakeP.cat.sprite != .sleeping && awakeP.cat.sprite != .tired,
+              "Now and Then: a parked cat sits there awake (\(awakeP.cat.sprite))")
+        check(sleepyP.isStaying && sleepyP.isSleeping && sleepyP.cat.sprite == .sleeping, "...Very Sleepy: it dozes off")
+        // Put it inside a window: let go gently over a window and it drops onto the window's
+        // inside bottom edge, stays there (riding the window), and, not sleepy, runs up and down it.
+        let box1 = WindowInfo(id: 11, pid: 1, frame: CGRect(x: 300, y: 200, width: 600, height: 400))
+        func inWin(_ f: CGRect) -> World { World(screens: [scr], windows: [WindowInfo(id: 11, pid: 1, frame: f)], cursor: CGPoint(x: 1300, y: 800)) }
+        var drop = make(CGPoint(x: 500, y: 450))
+        drop.sleepiness = 0.5
+        drop.updateWindows(inWin(box1.frame), dt: 0.1)
+        drop.mouseDown(on: .cat, at: CGPoint(x: 500, y: 450), time: 0)
+        drop.mouseDragged(to: CGPoint(x: 510, y: 450), time: 0.01)
+        drop.mouseUp(at: CGPoint(x: 510, y: 450), time: 0.5)
+        for i in 0..<300 {
+            drop.physics(dt: 1.0 / 60, world: inWin(box1.frame))
+            if i % 6 == 0 { drop.tick10(world: inWin(box1.frame)) }
+        }
+        for _ in 0..<20 { drop.tick10(world: inWin(box1.frame)) }
+        check(drop.isStaying && abs(drop.cat.position.y - 213) < 1,
+              "let go over a window, it drops in and lands on the window's inside bottom edge (y=\(Int(drop.cat.position.y)), \(drop.mode))")
+        var xs: [CGFloat] = []
+        for _ in 0..<150 { drop.tick10(world: inWin(box1.frame)); xs.append(drop.cat.position.x) }
+        let spread = (xs.max() ?? 0) - (xs.min() ?? 0)
+        check(drop.isStaying && spread > 150 && xs.allSatisfy { $0 >= 313 - 0.01 && $0 <= 887 + 0.01 }
+              && abs(drop.cat.position.y - 213) < 1,
+              "...and, not sleepy, runs up and down in there (\(Int(spread)) pt, never past the sides)")
+        let moved = box1.frame.offsetBy(dx: 40, dy: 60)
+        drop.updateWindows(inWin(moved), dt: 0.1)
+        drop.tick10(world: inWin(moved))
+        check(abs(drop.cat.position.y - 273) < 1, "...riding along when you move the window (y=\(Int(drop.cat.position.y)))")
+        let grown = CGRect(x: moved.minX, y: moved.minY - 100, width: moved.width, height: moved.height + 100)
+        drop.updateWindows(inWin(grown), dt: 0.1)
+        drop.tick10(world: inWin(grown))
+        check(abs(drop.cat.position.y - 173) < 1, "...and staying on the bottom edge when you resize it (y=\(Int(drop.cat.position.y)))")
+        // Thrown hard down through a window, it doesn't stop there (slams still reach the Touch Bar).
+        var hard = make(CGPoint(x: 500, y: 500))
+        hard.updateWindows(inWin(box1.frame), dt: 0.1)
+        hard.mouseDown(on: .cat, at: CGPoint(x: 500, y: 500), time: 0)
+        for k in 1...5 { hard.mouseDragged(to: CGPoint(x: 500, y: 500 - CGFloat(k) * 30), time: Double(k) * 0.01) }
+        hard.mouseUp(at: CGPoint(x: 500, y: 330), time: 0.06)
+        var firstHit: CGPoint?
+        for _ in 0..<300 where firstHit == nil {
+            hard.physics(dt: 1.0 / 60, world: inWin(box1.frame))
+            for e in hard.drainEvents() { if case .landed(_, _, let at) = e, firstHit == nil { firstHit = at } }
+        }
+        check((firstHit?.y ?? 999) < 150, "...but thrown down hard, it goes straight through to the floor (hit at y=\(Int(firstHit?.y ?? -1)))")
+        // Parked on a window's title bar, the menu bar or the Dock: the same.
+        var tbar = make(CGPoint(x: 500, y: 700))
+        tbar.sleepiness = 0.25
+        tbar.updateWindows(inWin(box1.frame), dt: 0.1)
+        tbar.mouseDown(on: .cat, at: CGPoint(x: 500, y: 700), time: 0)
+        tbar.mouseDragged(to: CGPoint(x: 510, y: 700), time: 0.01)
+        tbar.mouseUp(at: CGPoint(x: 510, y: 700), time: 0.5)
+        for i in 0..<300 {
+            tbar.physics(dt: 1.0 / 60, world: inWin(box1.frame))
+            if i % 6 == 0 { tbar.tick10(world: inWin(box1.frame)) }
+        }
+        var txs: [CGFloat] = []
+        for _ in 0..<150 { tbar.tick10(world: inWin(box1.frame)); txs.append(tbar.cat.position.x) }
+        check(tbar.isStaying && abs(tbar.cat.position.y - 613) < 1 && (txs.max()! - txs.min()!) > 150,
+              "put on a window's title bar, a wide-awake cat runs up and down it")
+        // Cats bump into each other.
+        var grid: [CGPoint] = []
+        var seed: UInt64 = 7
+        for _ in 0..<400 {
+            seed = seed &* 6364136223846793005 &+ 1442695040888963407
+            grid.append(CGPoint(x: CGFloat(seed >> 40 & 1023), y: CGFloat(seed >> 20 & 511)))
+        }
+        var brute = 0
+        for i in grid.indices { for j in grid.indices where j > i && hypot(grid[i].x - grid[j].x, grid[i].y - grid[j].y) < 25 { brute += 1 } }
+        check(CatCollisions.overlaps(grid, skip: grid.map { _ in false }, reach: 25).count == brute,
+              "finding cats that touch: the grid finds exactly the pairs a full search does (\(brute))")
+        var duo = [make(CGPoint(x: 600, y: 400)), make(CGPoint(x: 604, y: 400))]
+        for k in duo.indices { duo[k].tick10(world: world(duo[k].cat.position)) }
+        CatCollisions.separate(count: 2, skipFirst: false, swarmSpacing: nil) { k, f in f(&duo[k]) }
+        let apart = hypot(duo[0].cat.position.x - duo[1].cat.position.x, duo[0].cat.position.y - duo[1].cat.position.y)
+        check(apart >= 2 * duo[0].bumpRadius - 0.01 && duo[0].cat.position.x < 600 && duo[1].cat.position.x > 604,
+              "two cats that walk into each other are pushed apart, half each (\(Int(apart)) pt)")
+        var stay2 = [make(CGPoint(x: 600, y: 73)), make(CGPoint(x: 610, y: 80))]
+        for k in stay2.indices {
+            stay2[k].mouseDown(on: .cat, at: stay2[k].cat.position, time: 0)
+            stay2[k].mouseUp(at: stay2[k].cat.position, time: 0.05, clickCount: 2)
+            stay2[k].tick10(world: world(.zero))
+        }
+        CatCollisions.separate(count: 2, skipFirst: false, swarmSpacing: nil) { k, f in f(&stay2[k]) }
+        check(stay2[0].cat.position.y == 73 && stay2[1].cat.position.y == 80 && stay2[1].cat.position.x - stay2[0].cat.position.x > 10,
+              "...only sideways for cats sitting on something (they stay on it)")
+        var clipped = [make(CGPoint(x: 600, y: 400)), make(CGPoint(x: 604, y: 400))]
+        clipped[1].rightClick(.cat)
+        CatCollisions.separate(count: 2, skipFirst: false, swarmSpacing: nil) { k, f in f(&clipped[k]) }
+        check(clipped[0].cat.position.x == 600 && clipped[1].cat.position.x == 604, "...and a clipped (or napping, or boxed) cat isn't bumped")
+        // Throw a cat at another: it knocks it flying.
+        var pins = [make(CGPoint(x: 400, y: 400)), make(CGPoint(x: 520, y: 400))]
+        pins[1].tick10(world: world(CGPoint(x: 520, y: 400)))
+        pins[0].launch(at: CGPoint(x: 400, y: 400), velocity: CGVector(dx: 1800, dy: 200))
+        var hitPin: [Int] = [], thrownBefore: CGFloat = 0
+        for _ in 0..<40 where hitPin.isEmpty {
+            thrownBefore = pins[0].catBody.vel.dx
+            pins[0].physics(dt: 1.0 / 60, world: world(.zero))
+            hitPin = CatCollisions.bump(flyers: [0], count: 2, skipFirst: false) { k, f in f(&pins[k]) }
+        }
+        check(hitPin == [1] && pins[1].mode == .flying && pins[1].catBody.vel.dx > 300 && pins[1].catBody.vel.dy > 0
+              && pins[1].drainEvents().contains(.catBump),
+              "a cat thrown into another knocks it flying (\(Int(pins[1].catBody.vel.dx)), \(Int(pins[1].catBody.vel.dy)))")
+        check(pins[0].catBody.vel.dx < thrownBefore * 0.6, "...and loses speed doing it (\(Int(thrownBefore)) -> \(Int(pins[0].catBody.vel.dx)), \(pins[0].mode))")
+        // Even a full-speed yeet doesn't fly straight through a cat between two frames.
+        var bullet = [make(CGPoint(x: 300, y: 400)), make(CGPoint(x: 560, y: 400))]
+        bullet[1].tick10(world: world(CGPoint(x: 560, y: 400)))
+        bullet[0].launch(at: CGPoint(x: 300, y: 400), velocity: CGVector(dx: 6500, dy: 0))
+        var shot = false
+        for _ in 0..<20 where !shot {
+            bullet[0].physics(dt: 1.0 / 60, world: world(.zero))
+            shot = !CatCollisions.bump(flyers: [0], count: 2, skipFirst: false) { k, f in f(&bullet[k]) }.isEmpty
+        }
+        check(shot && bullet[1].mode == .flying, "...even thrown at full speed (it can't fly straight through)")
+        // Bumping levels (Settings › Cats › Bumping).
+        func knockSpeed(_ style: CatCollisions.Style, throwSpeed: CGFloat = 1800, gap: CGFloat = 120) -> CGFloat? {
+            var c = [make(CGPoint(x: 400, y: 400)), make(CGPoint(x: 400 + gap, y: 400))]
+            c[1].tick10(world: world(CGPoint(x: 400 + gap, y: 400)))
+            c[0].launch(at: CGPoint(x: 400, y: 400), velocity: CGVector(dx: throwSpeed, dy: 100))
+            for _ in 0..<60 {
+                c[0].physics(dt: 1.0 / 60, world: world(.zero))
+                if !CatCollisions.bump(flyers: [0], count: 2, skipFirst: false, style: style) { k, f in f(&c[k]) }.isEmpty {
+                    return hypot(c[1].catBody.vel.dx, c[1].catBody.vel.dy)
+                }
+            }
+            return nil
+        }
+        let normalHit = knockSpeed(.normal) ?? 0, crazyHit = knockSpeed(.crazy) ?? 0, chaosHit = knockSpeed(.chaos) ?? 0
+        check(crazyHit > normalHit * 1.5 && chaosHit > crazyHit,
+              "bumping Crazy and Total Chaos knock cats much harder (\(Int(normalHit)) → \(Int(crazyHit)) → \(Int(chaosHit)) pt/s)")
+        check(knockSpeed(.off) == nil, "...Off: a thrown cat flies straight through the others")
+        check(knockSpeed(.gentle, throwSpeed: 450, gap: 50) == nil && knockSpeed(.normal, throwSpeed: 450, gap: 50) != nil,
+              "...Gentle: only a proper throw knocks a cat over")
+        var ghosts = [make(CGPoint(x: 600, y: 400)), make(CGPoint(x: 604, y: 400))]
+        CatCollisions.separate(count: 2, skipFirst: false, swarmSpacing: nil, style: .off) { k, f in f(&ghosts[k]) }
+        check(ghosts[0].cat.position.x == 600 && ghosts[1].cat.position.x == 604, "...and cats walk through each other")
+        var pinball = [make(CGPoint(x: 600, y: 400)), make(CGPoint(x: 606, y: 400))]
+        let launchedPair = CatCollisions.separate(count: 2, skipFirst: false, swarmSpacing: nil, style: .chaos,
+                                                  roll: { _ in 0 }) { k, f in f(&pinball[k]) }
+        check(launchedPair.count == 2 && pinball.allSatisfy { $0.mode == .flying && $0.catBody.vel.dy > 500 }
+              && pinball[0].catBody.vel.dx < 0 && pinball[1].catBody.vel.dx > 0,
+              "...Total Chaos: two cats running into each other launch each other like pinballs")
+        var calmPair = [make(CGPoint(x: 600, y: 400)), make(CGPoint(x: 606, y: 400))]
+        let none = CatCollisions.separate(count: 2, skipFirst: false, swarmSpacing: nil, style: .crazy,
+                                          roll: { _ in 0 }) { k, f in f(&calmPair[k]) }
+        check(none.isEmpty && calmPair.allSatisfy { $0.mode != .flying }, "...(Crazy just pushes them apart)")
+        // Two flying cats bounce off each other.
+        var air = [make(CGPoint(x: 500, y: 500)), make(CGPoint(x: 518, y: 500))]
+        air[0].launch(at: CGPoint(x: 500, y: 500), velocity: CGVector(dx: 900, dy: 0))
+        air[1].launch(at: CGPoint(x: 518, y: 500), velocity: CGVector(dx: -900, dy: 0))
+        _ = CatCollisions.bump(flyers: [0, 1], count: 2, skipFirst: false) { k, f in f(&air[k]) }
+        check(air[0].catBody.vel.dx < 0 && air[1].catBody.vel.dx > 0, "two flying cats bounce off each other")
+        var odds = make(.zero)
+        let chances: [CGFloat] = [0.25, 0.5, 1, 2].map { odds.sleepiness = $0; return odds.outingNapChance }
+        check(zip(chances, chances.dropFirst()).allSatisfy { $0 < $1 } && chances[0] < 0.05 && chances[3] > 0.8,
+              "...and the sleepier, the likelier a nap up there (\(chances.map { Int($0 * 100) }) %)")
+        // Off by default in the engine (the app turns it on from Settings).
+        var tame = make(still)
+        tame.random = { _ in 0 }
+        for _ in 0..<200 { tame.tick10(world: ww) }
+        check({ if case .exploring = tame.mode { return false }; return true }(), "...and never explores with it turned off")
 
         // Laser pointer: it runs right onto the dot and pounces.
         var d = make(CGPoint(x: 200, y: 400))
@@ -1038,7 +1406,9 @@ extension SelfTest {
         // The sounds are built in: every one synthesises and has a length.
         let lengths = SoundBox().durations()
         check(lengths.count == 6 && lengths.allSatisfy { $0 > 0.1 },
-              "all six sounds are synthesised in the app (\(lengths.map { String(format: "%.2fs", $0) }.joined(separator: ", ")))")
+              "all six sounds load (\(lengths.map { String(format: "%.2fs", $0) }.joined(separator: ", ")))")
+        check(SoundBox.recordedMeow != nil && abs(lengths[1] - 0.8) < 0.05,
+              "the meow is the recording in the app bundle (meow.m4a, \(String(format: "%.2fs", lengths[1])))")
     }
 }
 
@@ -1404,6 +1774,24 @@ extension SelfTest {
         bigCats[napper].mouseUp(at: bigCats[napper].cat.position, time: 1.05, clickCount: 2)
         bigCats[napper].tick10(world: world(CGPoint(x: 1200, y: 600)))
         check(!bigCats[napper].inBigBox, "...or double-click one awake and out it climbs")
+        // 0.6.5: lift one out and let go of it right over the box: it doesn't drop straight
+        // back in (the big box's wide opening caught every cat you took out).
+        let third = seated[2]
+        let h3 = bigCats[third].cat.position
+        bigCats[third].mouseDown(on: .cat, at: h3, time: 2)
+        bigCats[third].mouseDragged(to: CGPoint(x: h3.x, y: h3.y + 60), time: 2.1)
+        bigCats[third].mouseDragged(to: CGPoint(x: h3.x, y: h3.y + 60), time: 2.5)
+        bigCats[third].mouseUp(at: CGPoint(x: h3.x, y: h3.y + 60), time: 2.6)
+        for _ in 0..<240 { bigCats[third].physics(dt: 1.0 / 60, world: world(.zero)) }
+        check(!bigCats[third].inBigBox, "...and a cat lifted out and let go right over the big box stays out")
+        // ...but pick it up again and drop it in, and in it goes.
+        let h4 = bigCats[third].cat.position
+        bigCats[third].mouseDown(on: .cat, at: h4, time: 5)
+        bigCats[third].mouseDragged(to: CGPoint(x: 500, y: 180), time: 5.1)
+        bigCats[third].mouseDragged(to: CGPoint(x: 500, y: 180), time: 5.5)
+        bigCats[third].mouseUp(at: CGPoint(x: 500, y: 180), time: 5.6)
+        for _ in 0..<240 where !bigCats[third].inBigBox { bigCats[third].physics(dt: 1.0 / 60, world: world(.zero)) }
+        check(bigCats[third].inBigBox, "...while one you drop in from outside still goes in")
 
         // Crowd cats nap in the GPU box heap (real GPU code).
         let crowd = CrowdController()

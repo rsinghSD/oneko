@@ -177,15 +177,27 @@ enum PixelArt {
         "   P   ",
     ], palette: ["P": RGBA(r: 255, g: 84, b: 132), "w": RGBA(r: 255, g: 214, b: 226)])
 
+    /// A fish bone (0.6.5: it was a dog bone). Same size, so it throws and fetches the same.
     static let bone = fromRows([
-        " ##          ## ",
-        "#oo#        #oo#",
-        "#ooo########ooo#",
-        " #oooooooooooo# ",
-        "#ooo########ooo#",
-        "#oo#        #oo#",
-        " ##          ## ",
+        "     #######  ##",
+        " #####o#o#o# ##o",
+        "##oo##o#o#o###o#",
+        "#o#oooooooooooo#",
+        "##oo##o#o#o###o#",
+        " #####o#o#o# ##o",
+        "     #######  ##",
     ], palette: ["#": RGBA(r: 0, g: 0, b: 0), "o": RGBA(r: 255, g: 255, b: 255)])
+
+    /// Bobs over a cat that's eating: a little fish.
+    static let eating = fromRows([
+        "   ####    # ",
+        "  #oooo#  ## ",
+        " #oeoooo##o# ",
+        "#ooooooooo#  ",
+        " #oooooo##o# ",
+        "  #oooo#  ## ",
+        "   ####    # ",
+    ], palette: ["#": RGBA(r: 30, g: 60, b: 110), "o": RGBA(r: 255, g: 150, b: 60), "e": RGBA(r: 20, g: 20, b: 20)])
 
     // MARK: - Food bowl
 

@@ -33,7 +33,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/Oneko"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
-cp Resources/oneko.gif Resources/oneko.js-LICENSE.txt Resources/AppIcon.icns "$APP/Contents/Resources/"
+cp Resources/oneko.gif Resources/oneko.js-LICENSE.txt Resources/AppIcon.icns Resources/meow.m4a "$APP/Contents/Resources/"
 codesign --force --sign - "$APP" >/dev/null 2>&1   # ad-hoc sign so it launches cleanly
 
 echo "Built $APP ($VERSION)"

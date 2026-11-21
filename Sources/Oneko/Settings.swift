@@ -56,6 +56,11 @@ final class Settings {
             Key.catsPlay: true,
             Key.weather: "live",
             Key.autoUpdateCheck: true,
+            Key.sleepiness: Sleepiness.sometimes.rawValue,
+            Key.dockFloor: DockFloor.top.rawValue,
+            Key.explores: true,
+            Key.scratchesWindows: true,
+            Key.bumping: Bumping.normal.rawValue,
         ])
         // 0.5.7: one box became any number of toys.
         if defaults.object(forKey: Key.boxCount) == nil {
@@ -84,6 +89,94 @@ final class Settings {
 
     /// The cat may fall asleep when left alone (on the spot, or at a nap spot).
     var naps: Bool { get { bool(Key.naps) } set { set(newValue, Key.naps) } }
+
+    /// How much the cats sleep (when naps are on).
+    enum Sleepiness: Int, CaseIterable {
+        case rarely = 1, sometimes = 2, often = 3, very = 4
+        var title: String {
+            switch self {
+            case .rarely: return "Rarely"
+            case .sometimes: return "Now and Then"
+            case .often: return "Often (classic)"
+            case .very: return "Very Sleepy"
+            }
+        }
+        /// Relative to classic oneko (1): how often it dozes off and nods off somewhere.
+        var factor: CGFloat {
+            switch self {
+            case .rarely: return 0.25
+            case .sometimes: return 0.5
+            case .often: return 1
+            case .very: return 2
+            }
+        }
+    }
+    /// 0.6.5: classic oneko slept a lot; "Now and Then" is the new default.
+    var sleepiness: Sleepiness {
+        get { Sleepiness(rawValue: defaults.integer(forKey: Key.sleepiness)) ?? .sometimes }
+        set { defaults.set(newValue.rawValue, forKey: Key.sleepiness) }
+    }
+
+    /// The Dock: something to stand on, or not there at all (walk on the ground in front of it).
+    enum DockFloor: String, CaseIterable {
+        case top, ground
+        var title: String {
+            switch self {
+            case .top: return "Stand on top of the Dock"
+            case .ground: return "Walk on the ground, in front of the Dock"
+            }
+        }
+    }
+    var dockFloor: DockFloor {
+        get { DockFloor(rawValue: defaults.string(forKey: Key.dockFloor) ?? "") ?? .top }
+        set { defaults.set(newValue.rawValue, forKey: Key.dockFloor) }
+    }
+
+    /// Left alone, cats go off on their own: climb up windows, stroll along title bars and
+    /// the menu bar.
+    var explores: Bool { get { bool(Key.explores) } set { set(newValue, Key.explores) } }
+    /// How cats bump into each other.
+    enum Bumping: String, CaseIterable {
+        case off, gentle, normal, crazy, chaos
+        var title: String {
+            switch self {
+            case .off: return "Off (they walk through each other)"
+            case .gentle: return "Gentle"
+            case .normal: return "Normal"
+            case .crazy: return "Crazy (much harder, bouncier)"
+            case .chaos: return "Total Chaos (pinball)"
+            }
+        }
+        var style: CatCollisions.Style {
+            switch self {
+            case .off: return .off
+            case .gentle: return .gentle
+            case .normal: return .normal
+            case .crazy: return .crazy
+            case .chaos: return .chaos
+            }
+        }
+    }
+    var bumping: Bumping {
+        get { Bumping(rawValue: defaults.string(forKey: Key.bumping) ?? "") ?? .normal }
+        set { defaults.set(newValue.rawValue, forKey: Key.bumping) }
+    }
+
+    /// Exploring, it stops to scratch the edges of windows.
+    var scratchesWindows: Bool { get { bool(Key.scratchesWindows) } set { set(newValue, Key.scratchesWindows) } }
+
+    /// Sizes of their own for the first cats (index = cat id, 0 = the first cat; 0 = the
+    /// Size setting).
+    static let maxSizedCats = 10
+    var catSizes: [Int] {
+        get { (defaults.array(forKey: Key.catSizes) as? [Int] ?? []).map { (0...3).contains($0) ? $0 : 0 } }
+        set { defaults.set(Array(newValue.prefix(Self.maxSizedCats)), forKey: Key.catSizes) }
+    }
+    /// The size cat `id` is drawn at (1×, 2× or 3×).
+    func size(ofCat id: Int) -> Int {
+        let own = id < Self.maxSizedCats ? (catSizes[safe: id] ?? 0) : 0
+        return own > 0 ? own : size.rawValue
+    }
     var hideInFullScreen: Bool { get { bool(Key.hideInFullScreen) } set { set(newValue, Key.hideInFullScreen) } }
     /// Keep chasing even when the system's Reduce Motion setting is on.
     var ignoreReduceMotion: Bool { get { bool(Key.ignoreReduceMotion) } set { set(newValue, Key.ignoreReduceMotion) } }
@@ -354,6 +447,8 @@ final class Settings {
         static let yarnCount = "yarnCount", lastYarnCount = "lastYarnCount"
         static let bowlCount = "bowlCount", bowlPositions = "bowlPositions"
         static let bigBox = "bigBox", catsPlay = "catsPlay", weather = "weather", catNames = "catNames"
+        static let sleepiness = "sleepiness", dockFloor = "dockFloor", explores = "explores", catSizes = "catSizes"
+        static let scratchesWindows = "scratchesWindows", bumping = "bumping"
         static let autoUpdateCheck = "autoUpdateCheck", lastUpdateCheck = "lastUpdateCheck", skippedVersion = "skippedVersion"
     }
 }

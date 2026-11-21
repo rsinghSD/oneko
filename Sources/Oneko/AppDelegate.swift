@@ -61,7 +61,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         self.sprites = sprites
         super.init()
         self.sprites = sheetForCurrentSkin()
-        world = WorldReader.read()
+        world = readWorld()
         play.toys = toys
         play.cat.position = startPosition()
     }
@@ -113,6 +113,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let tb = touchBar {   // Touch Bar mode: no desktop work at all
             tb.tick10(cursor: NSEvent.mouseLocation, screens: NSScreen.screens.map(\.frame),
                       speed: max(4, CGFloat(settings.speed.rawValue) * 0.6), naps: settings.naps,
+                      sleepiness: settings.sleepiness.factor,
                       paused: settings.paused)
             startPhysicsIfNeeded()
             return
@@ -122,7 +123,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if fresh && !juggling {
             refreshWindows()
         } else {
-            world = WorldReader.read(reusingWindowsOf: world)
+            world = readWorld(reusing: world)
             world.drawings = toolbox?.drawings ?? []
         }
         updateDeepSleep()
@@ -132,6 +133,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         play.tick10(world: world)
         handleEvents()
         tickExtras()
+        separateCats()
+        clearFinishedBowls()
         // Just dozed off (classic idle sleep, a nap spot, the box, staying): a sleepy sigh.
         let asleep = play.cat.sprite == .sleeping
         if asleep && !wasAsleep && !deepSleep { sounds.play(.sleep) }
@@ -155,8 +158,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSEvent.pressedMouseButtons & 1 != 0 && play.needsWindowTracking
     }
 
+    /// The desktop as the cats see it: with the Dock as a floor, or (Dock: on the ground) as
+    /// if it weren't there.
+    private func readWorld(reusing old: World? = nil) -> World {
+        let w = WorldReader.read(reusingWindowsOf: old)
+        return settings.dockFloor == .ground ? w.ignoringDock() : w
+    }
+
     private func refreshWindows() {
-        world = WorldReader.read()
+        world = readWorld()
         world.drawings = toolbox?.drawings ?? []
         let now = CACurrentMediaTime()
         let dt = CGFloat(min(0.25, now - lastWindowRead))
@@ -229,6 +239,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             moved.append(i)
             anyExtra = anyExtra || e.needsPhysics
         }
+        // Thrown cats knock into other cats (and bounce off flying ones).
+        for k in bumpFlyingCats() where !moved.contains(k) { moved.append(k); anyExtra = true }
         handleEvents(extras: moved)
         render(extras: moved)
         if !play.needsPhysics && !juggling && !anyExtra {
@@ -286,8 +298,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .woke: sounds.play(.meow)
         case .ate: stats.bump(.meals); sounds.play(.purr)
         case .played: stats.bump(.playdates); sounds.play(.mrrp)
+        case .dinnerBell: callEveryoneToDinner()
+        case .catBump: sounds.play(.mrrp)
         default: break
         }
+    }
+
+    /// Dinner's served: every cat on the desktop comes to eat, hungry or not.
+    private func callEveryoneToDinner() {
+        play.callToDinner()
+        for x in extras { x.play.callToDinner() }
+        sounds.play(.meow)
+    }
+
+    // MARK: - Cats bumping into each other
+
+    /// Cat `k`: 0 is the first cat, then the extra cats (`extras[k - 1]`).
+    private func withCatIndex(_ k: Int, _ f: (inout Playground) -> Void) {
+        if k == 0 { f(&play) } else { f(&extras[k - 1].play) }
+    }
+
+    /// 10 Hz: cats that have walked into each other are pushed apart (see `CatCollisions`).
+    private func separateCats() {
+        guard extras.count > 0, touchBar == nil,
+              tickCount % CatCollisions.separateEvery(extras.count + 1) == 0 else { return }
+        // A big swarm is squeezed closer than the cats are wide (and on the laser dot they
+        // pile on): then they only keep that far apart.
+        let spacing: CGFloat? = laserOn ? 30 * play.scale * 0.35
+            : settings.catBehavior == .swarm ? 30 * play.scale * swarmSquash : nil
+        let launched = CatCollisions.separate(count: extras.count + 1, skipFirst: noCat, swarmSpacing: spacing,
+                                              style: settings.bumping.style) { k, f in withCatIndex(k, f) }
+        if !launched.isEmpty { startPhysicsIfNeeded() }
+    }
+
+    /// 60 fps: thrown cats knock into other cats. Returns the extra cats it set flying.
+    private func bumpFlyingCats() -> [Int] {
+        guard extras.count > 0, touchBar == nil else { return [] }
+        var flyers: [Int] = []
+        if !noCat, Playground.body(&play).kind == .flying { flyers.append(0) }
+        for i in extras.indices where extras[i].needsPhysics && Playground.body(&extras[i].play).kind == .flying {
+            flyers.append(i + 1)
+        }
+        guard !flyers.isEmpty else { return [] }
+        return CatCollisions.bump(flyers: flyers, count: extras.count + 1, skipFirst: noCat,
+                                  style: settings.bumping.style) { k, f in withCatIndex(k, f) }
+            .filter { $0 > 0 }.map { $0 - 1 }
+    }
+
+    /// A bowl a cat has eaten from is cleared away once nobody's eating from it (or on the way).
+    private func clearFinishedBowls() {
+        guard touchBar == nil, toys.bowls.contains(where: \.finished) else { return }
+        for i in toys.bowls.indices.reversed() where toys.bowls[i].finished {
+            if Playground.usesBowl(&play, i) || extras.contains(where: { Playground.usesBowl(&$0.play, i) }) { continue }
+            toys.bowls.remove(at: i)
+            play.bowlRemoved(i)
+            for x in extras { x.play.bowlRemoved(i) }
+            var saved = settings.bowlPositions
+            if i < saved.count { saved.remove(at: i); settings.bowlPositions = saved }
+            settings.bowlCount = toys.bowls.count
+            settingsWindow?.refresh()
+        }
+    }
+
+    /// Toys › Feed the Cats: put a bowl out if there isn't one, fill them all, and call everyone.
+    @objc func feedCats() {
+        guard touchBar == nil else { return }
+        if settings.bowlCount == 0 { setBowlCount(1) }
+        for i in toys.bowls.indices { toys.bowls[i].food = ToyPile.Bowl.full }
+        callEveryoneToDinner()
+        render()
     }
 
     // MARK: - Drawing
@@ -600,6 +679,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let s = catStats.summary(cat: id)
                 if !s.isEmpty { text += " · " + s }
                 if p.isSleeping { text += " · double-click to wake" }
+                else if p.isStaying { text += " · staying put (double-click to let it go)" }
                 hintWindow.setText(text)
                 hintWindow.show(above: CGPoint(x: p.catPose.center.x, y: p.catPose.center.y + 14 * p.catScale))
             }
@@ -656,6 +736,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let night = settings.reacts && play.sleepy
         play.cat.speed = CGFloat(settings.speed.rawValue) * (night ? 0.75 : 1)
         play.cat.sleepEnabled = settings.naps
+        if play.sleepiness != settings.sleepiness.factor { play.sleepiness = settings.sleepiness.factor }
+        play.explores = settings.explores
+        play.scratchesWindows = settings.scratchesWindows
         play.spotWindows = settings.naps && settings.spotWindows
         play.spotMenuBar = settings.naps && settings.spotMenuBar
         play.spotDock = settings.naps && settings.spotDock
@@ -670,6 +753,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for (i, x) in extras.enumerated() {
             x.play.cat.speed = play.cat.speed * (1 + 0.08 * CGFloat(i % 8 + 1))   // a little personality
             x.play.cat.sleepEnabled = settings.naps
+            if x.play.sleepiness != settings.sleepiness.factor { x.play.sleepiness = settings.sleepiness.factor }
+            x.play.explores = settings.explores
+            x.play.scratchesWindows = settings.scratchesWindows
             x.play.paused = allPaused
             x.play.gravityMode = play.gravityMode
             x.play.sleepy = play.sleepy
@@ -680,6 +766,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         crowd?.scale = CGFloat(scale)
         crowd?.hideInFullScreen = settings.hideInFullScreen
         statusItem?.button?.appearsDisabled = allPaused
+        applyCatSizes()
+        render()
+    }
+
+    /// The Magnifier's boost for the first cat (1 = off).
+    private var magnified: CGFloat = 1
+
+    /// Each of the first 10 cats can have a size of its own (Settings › Cats › Each Cat…);
+    /// the rest use the Size setting. The toys stay at the Size setting.
+    private func applyCatSizes() {
+        let base = CGFloat(settings.size.rawValue)
+        func apply(_ p: inout Playground, _ w: CatWindow, id: Int, boost: CGFloat = 1) {
+            let own = CGFloat(settings.size(ofCat: id))
+            let want = own * boost / base
+            guard p.catSize != want || w.rig.scale != own * boost else { return }
+            p.setCatSize(want)
+            w.setScale(Int(own * boost))
+        }
+        apply(&play, catWindow, id: 0, boost: magnified)
+        for i in extras.indices.prefix(Settings.maxSizedCats - 1) {
+            apply(&extras[i].play, extras[i].window, id: i + 1)
+        }
+    }
+
+    /// Settings › Cats › Each Cat…: a size for cat `id` (0 = the Size setting).
+    func setSize(ofCat id: Int, _ size: Int) {
+        guard id < Settings.maxSizedCats else { return }
+        var list = settings.catSizes
+        while list.count <= id { list.append(0) }
+        list[id] = size
+        settings.catSizes = list
+        applyCatSizes()
+        handleEvents()
+        startPhysicsIfNeeded()
         render()
     }
 
@@ -851,8 +971,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             touchBar = tb
             tb.install()
             tb.show()
-            if settings.boxCount == 0 { settings.boxCount = 1 }   // the box always lives on the Touch Bar
-            tb.setBox(true)
+            // The box comes along only if you have boxes out (a trip to the Touch Bar used to
+            // put one out for good, so it showed up on the desktop when Neko came back).
+            tb.setBox(settings.boxOut)
             tb.setBone(settings.boneOut)
             setLogicRate(0.1)
         } else {
@@ -924,18 +1045,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if menu.items.count > 0 { menu.addItem(.separator()) }
 
         menu.addItem(item(settings.paused ? "Resume" : "Pause", #selector(togglePause), key: "p"))
+        let sleep = NSMenu()
+        sleep.addItem(item("Never Naps", #selector(pickSleepiness(_:)), checked: !settings.naps, tag: 0))
+        for level in Settings.Sleepiness.allCases {
+            sleep.addItem(item(level.title, #selector(pickSleepiness(_:)),
+                               checked: settings.naps && settings.sleepiness == level, tag: level.rawValue))
+        }
+        menu.addItem(submenu("Sleepiness", sleep))
+        menu.addItem(item("Explores on Its Own", #selector(toggleExplores), checked: settings.explores,
+                          enabled: touchBar == nil))
         menu.addItem(.separator())
 
         let toyMenu = NSMenu()
         let boxTitle = settings.boxCount > 1 && touchBar == nil ? "Cardboard Boxes (\(settings.boxCount.formatted()))" : "Cardboard Box"
         toyMenu.addItem(item(boxTitle, #selector(toggleBox), checked: touchBar?.hasBox ?? settings.boxOut))
-        let boneTitle = settings.boneCount > 1 && touchBar == nil ? "Bones (\(settings.boneCount))" : "Bone"
+        let boneTitle = settings.boneCount > 1 && touchBar == nil ? "Fish Bones (\(settings.boneCount))" : "Fish Bone"
         toyMenu.addItem(item(boneTitle, #selector(toggleBone), checked: touchBar?.hasBone ?? settings.boneOut))
         let yarnTitle = settings.yarnCount > 1 ? "Balls of Yarn (\(settings.yarnCount))" : "Ball of Yarn"
         toyMenu.addItem(item(yarnTitle, #selector(toggleYarn), checked: settings.yarnOut, enabled: touchBar == nil))
         toyMenu.addItem(item("Food Bowl", #selector(toggleBowl), checked: settings.bowlCount > 0, enabled: touchBar == nil))
         toyMenu.addItem(item("Laser Pointer", #selector(toggleLaser), checked: laserOn, enabled: touchBar == nil))
         toyMenu.addItem(.separator())
+        toyMenu.addItem(item("Feed the Cats", #selector(feedCats), enabled: touchBar == nil))
         toyMenu.addItem(item("Give Catnip", #selector(giveCatnip), enabled: touchBar == nil))
         menu.addItem(submenu("Toys", toyMenu))
         menu.addItem(item("Toolbox (Paint tools)", #selector(toggleToolbox), checked: toolbox != nil,
@@ -985,6 +1116,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func togglePause() { settings.paused.toggle(); applySettings() }
     @objc func toggleNaps() { settings.naps.toggle(); applySettings() }
+    /// Sleepiness menu: tag 0 = never naps, else a `Settings.Sleepiness`.
+    @objc func pickSleepiness(_ sender: NSMenuItem) { setSleepiness(Settings.Sleepiness(rawValue: sender.tag)) }
+    /// nil: never naps.
+    func setSleepiness(_ level: Settings.Sleepiness?) {
+        settings.naps = level != nil
+        if let level { settings.sleepiness = level }
+        applySettings()
+        settingsWindow?.refresh()
+    }
+    @objc func toggleExplores() { settings.explores.toggle(); applySettings(); settingsWindow?.refresh() }
+    func setBumping(_ b: Settings.Bumping) { settings.bumping = b; settingsWindow?.refresh() }
+    @objc func toggleScratches() { settings.scratchesWindows.toggle(); applySettings(); settingsWindow?.refresh() }
+    func setDockFloor(_ f: Settings.DockFloor) {
+        settings.dockFloor = f
+        world = readWorld(reusing: world)
+        world.drawings = toolbox?.drawings ?? []
+        // Back onto the Dock: whatever's in front of it is lifted on top, never bonked. (Off the
+        // Dock, whatever sat on it just falls to the ground, like when an auto-hiding Dock hides.)
+        if f == .top {
+            play.forgetDocks()
+            for x in extras { x.play.forgetDocks() }
+        }
+        startPhysicsIfNeeded()
+    }
     @objc func toggleSpotWindows() { settings.spotWindows.toggle(); applySettings() }
     @objc func toggleSpotMenuBar() { settings.spotMenuBar.toggle(); applySettings() }
     @objc func toggleSpotDock() { settings.spotDock.toggle(); applySettings() }
@@ -1071,7 +1226,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let screen = builtInScreen ?? NSScreen.main ?? NSScreen.screens[0]
         let f = screen.frame, vis = screen.visibleFrame
         let start = CGPoint(x: f.minX + along * f.width, y: vis.minY + 20)
-        world = WorldReader.read()
+        world = readWorld()
         if let i = cat, let x = extras[safe: i] {
             x.play.launch(at: start, velocity: v)
             x.window.orderFrontRegardless()
@@ -1661,11 +1816,11 @@ extension AppDelegate: ToolboxHost {
     /// Magnifier: huge for 10 seconds (3× the normal size at 1×, 2× otherwise).
     func magnifyCat(_ giant: Bool) {
         shrinkWork?.cancel()
-        let base = settings.size.rawValue
-        let k: CGFloat = giant ? (base == 1 ? 3 : 2) : 1
-        guard play.catSize != k else { return }
-        play.setCatSize(k)
-        catWindow.setScale(Int(CGFloat(base) * k))
+        let own = settings.size(ofCat: 0)
+        let k: CGFloat = giant ? (own == 1 ? 3 : 2) : 1
+        guard magnified != k else { return }
+        magnified = k
+        applyCatSizes()
         if giant {
             let work = DispatchWorkItem { [weak self] in self?.magnifyCat(false) }
             shrinkWork = work

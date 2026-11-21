@@ -77,6 +77,41 @@ enum CatMode: Equatable {
     case goingToBowl(Int)                         // hungry
     case eating(Int, ticksLeft: Int)
     case playing(PlayKind, ticksLeft: Int, leader: Bool)   // with another cat
+    case exploring(Outing)                                 // off on its own: climbing a window, the menu bar
+}
+
+/// Left alone, a cat goes off on its own: up the side of a window and along its title bar,
+/// or along the menu bar.
+struct Outing: Equatable {
+    /// `window`: up its side and along its title bar. `inside`: round the inside of its border.
+    enum Place: Equatable { case window(Int), inside(Int), menuBar }
+    enum Stage: Equatable { case approach, scratch, climb, stroll }
+    var place: Place
+    var stage: Stage = .approach
+    /// Window: -1 climbs its left side, +1 its right side.
+    var side: CGFloat = -1
+    /// Ticks of strolling left.
+    var ticksLeft: Int
+    /// Strolling east (+1) or west (-1).
+    var dir: CGFloat = 1
+    /// Ticks to sit and look about (or groom) before strolling on.
+    var pause = 0
+    /// Where your cursor was when it set off: move it away and the cat comes running.
+    var cursorAtStart: CGPoint
+    /// Inside a window: how far round the border it is (from the bottom-left corner,
+    /// anticlockwise).
+    var along: CGFloat = 0
+    /// Ticks of scratching the window's edge (a scratching post!) before moving on.
+    var scratch = 0
+    /// It's had its scratch at this corner (one per pass).
+    var cornerDone = false
+    /// Which window it's on or in, if any.
+    var windowID: Int? {
+        switch place {
+        case .window(let id), .inside(let id): return id
+        case .menuBar: return nil
+        }
+    }
 }
 
 /// What two cats get up to together.
@@ -132,6 +167,8 @@ struct CatPose: Equatable {
     var opacity: CGFloat = 1
     /// Wobble of a closed box with a cat that wants out.
     var rattle: CGFloat = 0
+    /// Tucking in at a food bowl (a little fish bobs over its head).
+    var eating = false
 }
 
 enum PlaygroundEvent: Equatable {
@@ -140,6 +177,9 @@ enum PlaygroundEvent: Equatable {
     case apex(height: CGFloat)                            // top of a flight, above where it started
     case landed(impact: CGFloat, onWindow: Int?, at: CGPoint)
     case fetched, bonked, dockYeet, dockBonk, batYarn, boxHop, woke, ate, played
+    case dinnerBell                                       // you clicked a bowl: everyone, come eat
+    case scratched                                        // gave a window a good scratch
+    case catBump                                          // knocked flying by another cat
 }
 
 /// Every toy: cardboard boxes, bones and balls of yarn. One pile is shared by every cat
@@ -208,6 +248,8 @@ final class ToyPile {
         var prop: Prop
         var food = Bowl.full
         static let full = 8
+        /// A cat has eaten from it: once nobody's eating from it (or on the way), it's cleared away.
+        var finished = false
     }
     var bowls: [Bowl] = []
     /// Boxes past the real ones: a heap on the floor, drawn by the graphics chip. They stay
@@ -346,6 +388,283 @@ enum PlayMatcher {
     }
 }
 
+/// Points on a grid of square cells, in flat arrays (no array per cell): a fixed number of
+/// hashed buckets, filled with a counting sort. A bucket can hold points from more than one
+/// cell, so callers check real distances.
+struct BucketGrid {
+    let cell: CGFloat
+    private let mask: Int
+    private var starts: [Int32]      // bucket b's points: order[starts[b] ..< starts[b + 1]]
+    private var order: [Int32]
+
+    init(_ points: [CGPoint], include: (Int) -> Bool, cell: CGFloat) {
+        self.cell = cell
+        var size = 64
+        while size < points.count * 2 { size <<= 1 }
+        mask = size - 1
+        var counts = [Int32](repeating: 0, count: size + 1)
+        var bucketOf = [Int32](repeating: -1, count: points.count)
+        for i in points.indices where include(i) {
+            let b = Self.bucket(points[i], cell, mask)
+            bucketOf[i] = Int32(b)
+            counts[b + 1] += 1
+        }
+        for b in 0..<size { counts[b + 1] += counts[b] }
+        starts = counts
+        var fill = counts
+        order = [Int32](repeating: 0, count: Int(counts[size]))
+        for i in points.indices where bucketOf[i] >= 0 {
+            let b = Int(bucketOf[i])
+            order[Int(fill[b])] = Int32(i)
+            fill[b] += 1
+        }
+    }
+
+    @inline(__always) private static func bucket(_ p: CGPoint, _ cell: CGFloat, _ mask: Int) -> Int {
+        bucket(Int((p.x / cell).rounded(.down)), Int((p.y / cell).rounded(.down)), mask)
+    }
+    @inline(__always) private static func bucket(_ x: Int, _ y: Int, _ mask: Int) -> Int {
+        Int(truncatingIfNeeded: (UInt64(bitPattern: Int64(x)) &* 0x9E37_79B9_7F4A_7C15) ^ (UInt64(bitPattern: Int64(y)) &* 0xC2B2_AE3D_27D4_EB4F)) & mask
+    }
+
+    /// Every point in the cells overlapping `rect` (and maybe a few more: check distances).
+    /// Each point once, even if two of those cells share a bucket.
+    func forEach(in rect: CGRect, _ body: (Int) -> Void) {
+        let x0 = Int((rect.minX / cell).rounded(.down)), x1 = Int((rect.maxX / cell).rounded(.down))
+        let y0 = Int((rect.minY / cell).rounded(.down)), y1 = Int((rect.maxY / cell).rounded(.down))
+        // Buckets already visited (two cells can share one), in a buffer on the stack.
+        let cells = (x1 - x0 + 1) * (y1 - y0 + 1)
+        withUnsafeTemporaryAllocation(of: Int.self, capacity: cells) { seen in
+            var count = 0
+            for gx in x0...x1 {
+                for gy in y0...y1 {
+                    let b = Self.bucket(gx, gy, mask)
+                    var dup = false
+                    for i in 0..<count where seen[i] == b { dup = true; break }
+                    if dup { continue }
+                    seen[count] = b
+                    count += 1
+                    for k in Int(starts[b])..<Int(starts[b + 1]) { body(Int(order[k])) }
+                }
+            }
+        }
+    }
+}
+
+/// Cats bumping into each other (0.6.5).
+enum CatCollisions {
+    /// Pairs of indices into `positions` closer than `reach` (each pair once), found with a grid
+    /// so thousands of cats stay cheap. `skip`: cats that take no part.
+    static func overlaps(_ positions: [CGPoint], skip: [Bool], reach r: CGFloat) -> [(Int, Int)] {
+        guard r > 0, positions.count > 1 else { return [] }
+        let grid = BucketGrid(positions, include: { !skip[$0] }, cell: r)
+        var out: [(Int, Int)] = []
+        for i in positions.indices where !skip[i] {
+            let a = positions[i]
+            grid.forEach(in: CGRect(x: a.x - r, y: a.y - r, width: 2 * r, height: 2 * r)) { j in
+                guard j > i else { return }
+                let b = positions[j]
+                if (a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y) < r * r { out.append((i, j)) }
+            }
+        }
+        return out
+    }
+
+    /// Reach cat `k` (0 is the first cat) and do something to it in place.
+    typealias Access = (Int, (inout Playground) -> Void) -> Void
+
+    private static func read(_ k: Int, _ cat: Access) -> (pos: CGPoint, kind: Playground.BodyKind, r: CGFloat) {
+        var out = (pos: CGPoint.zero, kind: Playground.BodyKind.none, r: CGFloat(0))
+        cat(k) { p in
+            let b = Playground.body(&p)
+            out = (b.pos, b.kind, Playground.bumpRadius(&p))
+        }
+        return out
+    }
+
+    /// 10 Hz: cats that have walked into each other are pushed apart, half each (sideways
+    /// only for a cat on a window, the Dock or the ground). Napping cats, cats in boxes, cats
+    /// you're holding and flying cats take no part. `swarmSpacing`: in a swarm squeezed closer
+    /// than the cats are wide, they only keep that far apart. With `style.pinball`, two cats
+    /// running into each other launch each other into the air; returns those cats.
+    @discardableResult
+    static func separate(count n: Int, skipFirst: Bool, swarmSpacing: CGFloat?, style: Style = .normal,
+                         roll: (Int) -> Int = { Dice.roll($0) }, _ cat: Access) -> [Int] {
+        var launched: [Int] = []
+        guard n > 1, style.separates else { return launched }
+        var pos: [CGPoint] = [], skip: [Bool] = [], radius: [CGFloat] = []
+        pos.reserveCapacity(n); skip.reserveCapacity(n); radius.reserveCapacity(n)
+        for k in 0..<n {
+            let b = read(k, cat)
+            pos.append(b.pos)
+            skip.append(b.kind == .none || b.kind == .flying || (k == 0 && skipFirst))
+            radius.append(b.r)
+        }
+        var squeeze: CGFloat = 1
+        if let s = swarmSpacing { squeeze = min(1, s * 0.95 / max(2 * (radius.first ?? 1), 1)) }
+        let reach = (radius.max() ?? 0) * 2 * squeeze
+        for (i, j) in overlaps(pos, skip: skip, reach: reach) {
+            let r = (radius[i] + radius[j]) * squeeze
+            let push = separation(pos[i], pos[j], reach: r, tieBreak: i &+ j)
+            guard push != .zero else { continue }
+            // Total chaos: a real collision (not a squeezed swarm touching) sends both flying.
+            if style.pinball > 0, squeeze >= 1, hypot(push.dx, push.dy) > r * 0.25, roll(3) == 0 {
+                let m = max(hypot(push.dx, push.dy), 0.01)
+                let nx = push.dx / m, ny = push.dy / m
+                let up = style.pinball * 0.7
+                var a = false, b = false
+                cat(i) { a = $0.knockedByCat(CGVector(dx: nx * style.pinball, dy: ny * style.pinball + up), spin: style.spin) }
+                cat(j) { b = $0.knockedByCat(CGVector(dx: -nx * style.pinball, dy: -ny * style.pinball + up), spin: style.spin) }
+                if a { launched.append(i) }
+                if b { launched.append(j) }
+                if a || b { continue }
+            }
+            let half = CGVector(dx: push.dx / 2, dy: push.dy / 2)
+            cat(i) { $0.shove(half) }
+            cat(j) { $0.shove(CGVector(dx: -half.dx, dy: -half.dy)) }
+        }
+        return launched
+    }
+
+    /// How often (in 10 Hz ticks) to push cats apart: every tick, but with thousands of cats
+    /// every third (still smooth, and a third of the work).
+    static func separateEvery(_ cats: Int) -> Int { cats > 1000 ? 3 : 1 }
+
+    /// How wild bumping is (Settings › Cats › Bumping).
+    struct Style: Equatable {
+        /// Cats push apart where they meet.
+        var separates = true
+        /// Thrown cats knock into others (and bounce off each other in mid-air).
+        var knocks = true
+        /// How hard a thrown cat sends another flying (1 = normal).
+        var knock: CGFloat = 1
+        /// And how much extra upward kick that gets (pt/s).
+        var lift: CGFloat = 450
+        /// The slowest throw that knocks a cat over (pt/s, toward it).
+        var threshold: CGFloat = 250
+        /// How much of its speed into the hit the thrown cat keeps.
+        var keep: CGFloat = 0.3
+        /// Mid-air: share of the closing speed traded (0.9 = a bit less than a perfect bounce;
+        /// past 1, they fly apart faster than they came).
+        var bounce: CGFloat = 0.9
+        /// How much a knocked cat spins.
+        var spin: CGFloat = 1
+        /// Running into each other launches both cats this fast (0: they just push apart).
+        var pinball: CGFloat = 0
+        /// Up to this many cats in the air at once bounce off each other.
+        var midAir = 100
+
+        static let off = Style(separates: false, knocks: false)
+        static let gentle = Style(knock: 0.5, lift: 150, threshold: 600, keep: 0.6, bounce: 0.5, spin: 0.5)
+        static let normal = Style()
+        static let crazy = Style(knock: 2, lift: 1000, threshold: 120, keep: 0.15, bounce: 1.3, spin: 2.5, midAir: 200)
+        static let chaos = Style(knock: 3.2, lift: 1600, threshold: 60, keep: 0.05, bounce: 1.7, spin: 4,
+                                 pinball: 1500, midAir: 300)
+    }
+
+    /// 60 fps: each flying cat in `flyers` that hits another cat up and about knocks it
+    /// flying (and slows down); two flying cats bounce off each other. Returns the cats it
+    /// knocked flying.
+    static func bump(flyers: [Int], count n: Int, skipFirst: Bool, frame: CGFloat = 1.0 / 60, style: Style = .normal,
+                     _ cat: Access) -> [Int] {
+        var knocked: [Int] = []
+        guard !flyers.isEmpty, n > 1, style.knocks else { return knocked }
+        // Every cat that can be bumped, on a grid (thousands of cats, thousands thrown: still cheap).
+        var pos = [CGPoint](repeating: .zero, count: n), rad = [CGFloat](repeating: 0, count: n)
+        var maxR: CGFloat = 1
+        var inPlay = [Bool](repeating: false, count: n)
+        // A whole swarm in the air at once (the Dock bonked them all): they only knock into
+        // cats on the ground, not each other (hundreds bouncing off each other is just noise,
+        // and costly).
+        let crowdedAir = flyers.count > style.midAir
+        var any = false
+        for k in 0..<n {
+            let b = read(k, cat)
+            pos[k] = b.pos; rad[k] = b.r
+            maxR = max(maxR, b.r)
+            inPlay[k] = b.kind != .none && !(crowdedAir && b.kind == .flying) && !(k == 0 && skipFirst)
+            any = any || inPlay[k]
+        }
+        guard any else { return knocked }
+        let grid = BucketGrid(pos, include: { inPlay[$0] }, cell: 2 * maxR)
+        var near: [Int] = []
+        for f in flyers {
+            let me = read(f, cat)
+            guard me.kind == .flying else { continue }
+            var fv0 = CGVector.zero
+            cat(f) { fv0 = Playground.velocity(&$0) }
+            // Where it was a frame ago: a fast throw covers a lot of ground in a frame, so check
+            // the whole stretch (no flying straight through a cat), and hit from that side.
+            let prev = CGPoint(x: me.pos.x - fv0.dx * frame, y: me.pos.y - fv0.dy * frame)
+            let minX = min(prev.x, me.pos.x), maxX = max(prev.x, me.pos.x)
+            let minY = min(prev.y, me.pos.y), maxY = max(prev.y, me.pos.y)
+            near.removeAll(keepingCapacity: true)
+            let pad = me.r + maxR
+            grid.forEach(in: CGRect(x: minX - pad, y: minY - pad, width: maxX - minX + 2 * pad, height: maxY - minY + 2 * pad)) { k in
+                guard k != f else { return }
+                let p = pos[k], reach = me.r + rad[k]
+                if p.x > minX - reach, p.x < maxX + reach, p.y > minY - reach, p.y < maxY + reach { near.append(k) }
+            }
+            for k in near {
+                let o = read(k, cat)                       // (now: it may have been knocked already)
+                if crowdedAir && o.kind == .flying { continue }
+                let reach = me.r + o.r
+                guard o.kind != .none, o.pos.x > minX - reach, o.pos.x < maxX + reach,
+                      o.pos.y > minY - reach, o.pos.y < maxY + reach else { continue }
+                // The closest it came to that cat along the way.
+                let sx = me.pos.x - prev.x, sy = me.pos.y - prev.y, len2 = sx * sx + sy * sy
+                let t = len2 > 0 ? max(0, min(1, ((o.pos.x - prev.x) * sx + (o.pos.y - prev.y) * sy) / len2)) : 1
+                let c = CGPoint(x: prev.x + sx * t, y: prev.y + sy * t)
+                guard hypot(o.pos.x - c.x, o.pos.y - c.y) < reach else { continue }
+                var dx = o.pos.x - prev.x, dy = o.pos.y - prev.y
+                var d = hypot(dx, dy)
+                if d < 0.01 { dx = o.pos.x - me.pos.x; dy = o.pos.y - me.pos.y; d = hypot(dx, dy) }
+                guard d > 0.01 else { continue }
+                let nx = dx / d, ny = dy / d
+                var fv = CGVector.zero
+                cat(f) { fv = Playground.velocity(&$0) }
+                if o.kind == .flying {
+                    // Both in the air: they bounce off each other (only while closing in).
+                    var ov = CGVector.zero
+                    cat(k) { ov = Playground.velocity(&$0) }
+                    let closing = (fv.dx - ov.dx) * nx + (fv.dy - ov.dy) * ny
+                    guard closing > 0 else { continue }
+                    let j = closing * style.bounce
+                    cat(f) { $0.setFlightVelocity(CGVector(dx: fv.dx - nx * j, dy: fv.dy - ny * j)) }
+                    cat(k) { $0.setFlightVelocity(CGVector(dx: ov.dx + nx * j, dy: ov.dy + ny * j)) }
+                } else {
+                    // Into a cat that's up and about: it's knocked flying, the thrown one slows.
+                    let along = fv.dx * nx + fv.dy * ny
+                    guard along > style.threshold else { continue }      // just drifting past
+                    let k1 = 0.5 * style.knock
+                    let hit = CGVector(dx: (fv.dx + nx * along) * k1, dy: (fv.dy + ny * along) * k1 + style.lift)
+                    var ok = false
+                    cat(k) { ok = $0.knockedByCat(hit, spin: style.spin) }
+                    guard ok else { continue }
+                    let lose = 1 - style.keep
+                    cat(f) { $0.setFlightVelocity(CGVector(dx: fv.dx - nx * along * lose, dy: fv.dy - ny * along * lose)) }
+                    knocked.append(k)
+                }
+            }
+        }
+        return knocked
+    }
+
+    /// How far to push two overlapping cats apart (each moves its share along the line
+    /// between them; a cat that can't be moved has share 0). Returns the push for `a`; `b`
+    /// gets the opposite, scaled by its share.
+    static func separation(_ a: CGPoint, _ b: CGPoint, reach: CGFloat, tieBreak: Int) -> CGVector {
+        var dx = a.x - b.x, dy = a.y - b.y
+        var d = hypot(dx, dy)
+        if d < 0.01 {                                   // right on top of each other: pick a side
+            dx = tieBreak % 2 == 0 ? 1 : -1; dy = 0; d = 1
+        }
+        let overlap = reach - d
+        guard overlap > 0 else { return .zero }
+        return CGVector(dx: dx / d * overlap, dy: dy / d * overlap)
+    }
+}
+
 /// The cat, its toys and how they react to the desktop and the mouse. No AppKit.
 struct Playground {
     var cat: NekoBrain
@@ -372,6 +691,24 @@ struct Playground {
     var isHungry: Bool { hunger >= hungryAfter }
     /// For tests and the demo: skip ahead to dinner time.
     mutating func makeHungry() { hunger = hungryAfter }
+
+    /// Dinner's served (you clicked a bowl, or Feed the Cats): it comes to eat now, hungry or
+    /// not. A cat dozing in place, sitting it off or napping (not in a box) gets up for it.
+    mutating func callToDinner() {
+        guard !paused, !gravityMode else { return }
+        hunger = max(hunger, hungryAfter)
+        switch mode {
+        case .staying, .petted, .dazed, .stretching, .chasingYarn, .zoomies, .goingToSpot:
+            stayWindow = nil
+            angry = false
+            mode = .chasing
+            cat.wakeUp()
+        case .napping(let spot, _) where !spot.kind.isBox:
+            mode = .chasing
+            cat.wakeUp()
+        default: break
+        }
+    }
     /// The cat it's playing with (kept up to date by the app).
     var partner: CGPoint?
     private var playTarget: CGPoint?
@@ -406,7 +743,15 @@ struct Playground {
     var laser = false
     /// Late at night: naps more often.
     var sleepy = false
-    private var zoomBoost = 0          // gravity mode's catnip: ticks of triple speed
+    /// Left alone, it goes off exploring now and then (windows, the menu bar).
+    var explores = false
+    /// Exploring, it stops to scratch the edges of windows.
+    var scratchesWindows = false
+    /// How much it sleeps, relative to classic oneko (1): Settings › Behavior › Naps.
+    var sleepiness: CGFloat = 1 { didSet { cat.sleepiness = sleepiness } }
+    /// How long a nap lasts, relative to classic oneko.
+    private var napLength: CGFloat { min(1.7, 0.3 + 0.7 * sleepiness) }
+    private var zoomBoost = 0          // gravity mode's catnip: ticks of catnip speed
     private var batCooldown = 0
     private var launchY: CGFloat = 0
     private var rising = false
@@ -419,6 +764,9 @@ struct Playground {
     private var rattling = false
     /// The boxes this cat holds a claim on (it's napping in them).
     private var claimedBox: Int?
+    /// The box you just lifted it out of: let go over it and it doesn't drop straight back in
+    /// (with the big box's wide opening, you couldn't get a cat out at all). Until it lands.
+    private var liftedFromBox: Int?
     /// It has claimed a bone (`claimBone`) and not let go of it since: it may be the fetcher.
     private var mayHoldBone = false
     private var claimedHeap: Int?
@@ -453,7 +801,18 @@ struct Playground {
     private var parkWhenSettled = false
     /// The window (or drawing) a parked cat is sitting on, so it rides along.
     private var stayWindow: Int?
+    /// Parked on the inside of `stayWindow`'s bottom edge (it rides that edge, not the top).
+    private var stayInside = false
+    /// You put it there (on a window, the Dock, the menu bar): a cat that isn't sleepy runs up
+    /// and down it. (Told to stay with a double-click, it sits.)
+    private var roamsParked = false
+    private var parkDir: CGFloat = 1
+    private var parkPause = 0
+    /// Let go of gently over a window: this flight lands inside it, on its bottom edge.
+    private var dropInside: Int?
     private var lastScreens: [ScreenInfo] = []
+    /// Where it was headed last tick (your cursor, or its spot in the swarm).
+    private var lastCursor = CGPoint.zero
     /// `world.screenFrames`, kept while the screens stay the same (every tick would otherwise
     /// build a new array, for every cat).
     private var frames: (of: [ScreenInfo], frames: [CGRect]) = ([], [])
@@ -655,7 +1014,8 @@ struct Playground {
                        carryingBone: mode == .returningBone || (mode == .walking && walkGoal == .bringBack),
                        boxClosed: boxClosed, inBigBox: inBigBox, clipped: { if case .pinned = mode { return true }; return false }(),
                        opacity: { if case .erased = mode { return 0 }; return hp }(),
-                       rattle: rattle)
+                       rattle: rattle,
+                       eating: { if case .eating = mode { return true }; return false }())
         }
     }
 
@@ -826,6 +1186,7 @@ struct Playground {
 
     mutating func tick10(world: World) {
         lastScreens = world.screens
+        lastCursor = world.cursor
         if batCooldown > 0 { batCooldown -= 1 }
         if zoomBoost > 0 { zoomBoost -= 1 }
         defer { batNearbyYarn() }
@@ -850,7 +1211,7 @@ struct Playground {
         // The closest cat goes for a thrown bone; a closer one can take over on the way.
         if !paused, !fetchingBone, !toys.bones.isEmpty, let (i, d) = wantedBone() {
             switch mode {
-            case .chasing, .petted, .goingToSpot:
+            case .chasing, .petted, .goingToSpot, .exploring:
                 claimBone(i, distance: d)
                 mode = .fetching
             case .napping(let spot, _) where !spot.kind.isBox:
@@ -872,6 +1233,7 @@ struct Playground {
             } else {
                 cat.tick(cursor: world.cursor, screens: screenFrames(world))
                 if !paused { maybeStartNap(world) }
+                if !paused, mode == .chasing { maybeExplore(world) }
             }
             // Dinner time, and there's kibble out.
             if !paused, !laser, isHungry, let i = nearestBowlWithFood() {
@@ -901,7 +1263,7 @@ struct Playground {
             if cat.walk(to: spot.point) {
                 if spot.kind.isBox { events.append(.boxHop) }
                 napFrame = 0
-                mode = .napping(spot, ticksLeft: 400 + random(800))   // 40 s – 2 min
+                mode = .napping(spot, ticksLeft: Int(CGFloat(400 + random(800)) * napLength))   // classic: 40 s – 2 min
                 syncClaims()
             } else {
                 mode = .goingToSpot(spot)
@@ -950,6 +1312,7 @@ struct Playground {
                     parkWhenSettled = false
                     angry = false
                     stayWindow = win
+                    roamsParked = true
                     mode = .staying(frame: 0)
                 } else {
                     angry = false
@@ -992,7 +1355,15 @@ struct Playground {
             bone.body.pos = cat.position
 
         case .staying(let n):
-            cat.set(n < 8 ? .tired : .sleeping, n / 4)
+            if dozesWhenStaying {
+                cat.set(n < 8 ? .tired : .sleeping, n / 4)
+            } else if roamsParked, let r = parkedSurface(world) {
+                roamParked(r)
+            } else {
+                // Not sleepy: it sits there wide awake, looking about and washing now and then.
+                let t = n % 150
+                cat.set(t >= 120 && t < 134 ? .scratchSelf : t >= 60 && t < 66 ? .alert : .idle, t)
+            }
             mode = .staying(frame: n + 1)
 
         case .chasingYarn(let left):
@@ -1008,7 +1379,7 @@ struct Playground {
             }
 
         case .zoomies(let left, var target):
-            if cat.walk(to: target, speedMultiplier: 3) || random(25) == 0 { target = randomSpot() }
+            if cat.walk(to: target, speedMultiplier: Self.catnipSpeed) || random(25) == 0 { target = randomSpot() }
             if left % 20 == 0 { events.append(.heart) }
             mode = left <= 0 ? .chasing : .zoomies(ticksLeft: left - 1, target: target)
 
@@ -1024,7 +1395,7 @@ struct Playground {
                 // Classic idle life (grooming, yawning, naps) while it waits under you.
                 cat.tick(cursor: cat.position, screens: screenFrames(world))
                 // ...and a box nearby is irresistible: walk over and climb in.
-                if !paused, cat.sleepEnabled, cat.idleTime > 30, random(250) == 0,
+                if !paused, cat.sleepEnabled, cat.idleTime > 30, random(Int(250 / max(sleepiness, 0.05))) == 0,
                    let i = nearestFreeBox(to: cat.position), toys.boxes[i].prop.isResting {
                     walkGoal = .nap
                     walkBox = i
@@ -1048,13 +1419,14 @@ struct Playground {
             napFrame += 1
             if left <= 0 {
                 if toys.bowls[i].food > 0 { toys.bowls[i].food -= 1 }
+                toys.bowls[i].finished = true
                 hunger = 0
                 hungryAfter = 12_000 + random(12_000)
                 events.append(.ate)
                 events.append(.heart)
                 napFrame = 0
-                if random(2) == 0 && cat.sleepEnabled {       // a food coma
-                    mode = .napping(NapSpot(kind: .here, point: cat.position), ticksLeft: 300 + random(300))
+                if cat.sleepEnabled && CGFloat(random(100)) < 50 * sleepiness {   // a food coma
+                    mode = .napping(NapSpot(kind: .here, point: cat.position), ticksLeft: Int(CGFloat(300 + random(300)) * napLength))
                 } else {
                     mode = .chasing
                 }
@@ -1091,6 +1463,21 @@ struct Playground {
             napFrame += 1
             mode = .playing(kind, ticksLeft: left - 1, leader: leader)
 
+        case .exploring(var o):
+            // You moved the mouse (or it's bedtime): it drops what it's doing and comes running.
+            if paused || laser || hypot(world.cursor.x - o.cursorAtStart.x, world.cursor.y - o.cursorAtStart.y) > 90 * scale {
+                if case .window = o.place, o.stage == .climb { startFalling(velocity: .zero); break }   // lets go of the wall
+                if case .inside(let id) = o.place, o.stage == .stroll, let f = world.window(id)?.frame,
+                   let loop = insideLoop(f), Self.loopSegment(o.along, loop) != 0 {
+                    startFalling(velocity: .zero)                                                      // lets go of the border
+                    break
+                }
+                mode = .chasing
+                cat.wakeUp()
+                break
+            }
+            if explore(&o, world) { mode = .exploring(o) }
+
         case .erased(let left):
             if left <= 0 { respawn(world) } else { mode = .erased(ticksLeft: left - 1) }
 
@@ -1118,7 +1505,10 @@ struct Playground {
 
         case .flying:
             flyFrame += 1
-            let result = Physics.step(&catBody, shape: catShape, dt: dt, world: world)
+            if let id = dropInside, let f = world.window(id)?.frame, cat.position.y - catShape.halfH > f.maxY {
+                dropInside = nil                     // flew out over the top
+            }
+            let result = Physics.step(&catBody, shape: catShape, dt: dt, world: world, inside: dropInside)
             cat.position = catBody.pos
             cat.set(flailSprite(), flyFrame / 4)
             if rising && catBody.vel.dy <= 0 {
@@ -1144,10 +1534,13 @@ struct Playground {
                 let onFloor = s.map { abs(feet - $0.floor(at: cat.position.x)) < 2 } ?? false
                 events.append(.landed(impact: impact, onWindow: onFloor ? nil : 0, at: cat.position))
             case .rested(let win, let impact):
+                stayInside = win != nil && win == dropInside
+                dropInside = nil
                 events.append(.landed(impact: impact, onWindow: win, at: cat.position))
                 if impact > 1300 { angry = true }
                 // You put it on the Dock or on a window: it'll stay there.
                 if userLaunched && (win != nil || landedOnDock(world)) { parkWhenSettled = true }
+                liftedFromBox = nil
                 squash = 0.7
                 catBody.spin = 0
                 mode = .landing(elapsed: 0, onWindow: win)
@@ -1342,6 +1735,13 @@ struct Playground {
             mode = .flying
             userLaunched = true
             lastThrow = catBody.vel
+            // Let go of gently over a window (below its title bar): it drops in and lands on
+            // the window's bottom edge, inside. (Thrown hard, it flies as before: a slam still
+            // drops it into the Touch Bar.)
+            dropInside = speed < 900 ? lastWindowList.first(where: {
+                $0.frame.contains(cat.position) && cat.position.y < $0.frame.maxY - Self.titleBar * scale
+                    && $0.frame.width > 4 * catShape.halfW && $0.frame.height > 3 * catShape.halfH
+            })?.id : nil
             launchY = cat.position.y
             rising = catBody.vel.dy > 0
             events.append(.thrown(speed: speed))
@@ -1370,10 +1770,17 @@ struct Playground {
 
     var isDragging: Bool { grab?.dragging ?? false }
 
+    /// Told to stay or parked (on the Dock, a window, the menu bar): does it doze off there?
+    /// Only a sleepy cat (Often, Very Sleepy); otherwise it sits there awake.
+    var dozesWhenStaying: Bool { cat.sleepEnabled && sleepiness >= 1 }
+
+    /// Staying put where you left it (asleep or not): double-click to let it go.
+    var isStaying: Bool { if case .staying = mode { return true }; return false }
+
     /// Asleep until you wake it: told to stay, parked, or off napping somewhere.
     var isSleeping: Bool {
         switch mode {
-        case .staying: return true
+        case .staying: return dozesWhenStaying
         case .napping: return !(inBox && boxClosed)
         default: return false
         }
@@ -1442,6 +1849,7 @@ struct Playground {
         switch thing {
         case .cat:
             if mode == .returningBone || walkGoal == .bringBack { dropBone(falling: true) }
+            liftedFromBox = boxIndex
             walkGoal = .cursor
             angry = false
             parkWhenSettled = false
@@ -1503,6 +1911,7 @@ struct Playground {
                 if mode == .returningBone { dropBone(falling: true) }
                 angry = false
                 stayWindow = nil
+                roamsParked = false                 // "stay!": it sits right here
                 mode = .staying(frame: 0)
             }
         case .cat:
@@ -1527,11 +1936,13 @@ struct Playground {
         case .box:
             break
         case .bowl:
-            // Click the bowl: fill it up.
-            if i < toys.bowls.count, toys.bowls[i].food < ToyPile.Bowl.full {
+            // Click the bowl: fill it up, and dinner's served (every cat comes to eat).
+            guard i < toys.bowls.count else { break }
+            if toys.bowls[i].food < ToyPile.Bowl.full {
                 toys.bowls[i].food = ToyPile.Bowl.full
                 events.append(.heart)
             }
+            events.append(.dinnerBell)
         case .yarn:
             // A little nudge: it rolls off, and the cats can't resist.
             let vx: CGFloat = random(2) == 0 ? -350 : 350, spin = CGFloat(random(20) - 10)
@@ -1572,6 +1983,7 @@ struct Playground {
             guard b.prop.isResting || b.prop.state == .held || b.prop.state == .pinned, !b.closed,
                   ToyPile.isFree(b, for: catID) || b.prop.state == .held else { continue }
             if !b.big, b.napper != nil, b.napper != catID { continue }
+            if i == liftedFromBox { continue }   // just taken out of this one
             return i
         }
         return nil
@@ -1622,12 +2034,59 @@ struct Playground {
         cat.position.y = min(s.visible.maxY + catShape.halfH - catShape.foot, s.frame.maxY - catShape.halfH + 3 * scale)
         catBody = Body(pos: cat.position)
         stayWindow = nil
+        roamsParked = true
         mode = .staying(frame: 0)
         return true
     }
 
+    /// Where a parked cat can run up and down (x range): the window it's on (or in), the
+    /// menu bar, or the top of the Dock. Nil: it just sits (e.g. on a drawing).
+    private func parkedSurface(_ world: World) -> ClosedRange<CGFloat>? {
+        let hw = catShape.halfW, x = cat.position.x
+        let feet = cat.position.y - catShape.halfH + catShape.foot
+        func span(_ lo: CGFloat, _ hi: CGFloat) -> ClosedRange<CGFloat>? { hi - lo > 2 * hw ? (lo + hw)...(hi - hw) : nil }
+        if let id = stayWindow {
+            guard id >= 0, let f = world.window(id)?.frame else { return nil }
+            return span(f.minX, f.maxX)
+        }
+        if let s = world.screen(containing: cat.position), cat.position.y > s.visible.maxY {
+            return span(s.frame.minX, s.frame.maxX)                              // the menu bar
+        }
+        for s in world.screens {
+            if let d = s.dock, d.width >= d.height, abs(feet - d.maxY) < 2, x >= d.minX, x <= d.maxX {
+                return span(d.minX, d.maxX)                                      // the top of the Dock
+            }
+        }
+        return nil
+    }
+
+    /// Parked and wide awake: it runs up and down where you put it, stopping now and then
+    /// to look about or wash.
+    private mutating func roamParked(_ r: ClosedRange<CGFloat>) {
+        napFrame += 1
+        if parkPause > 0 {
+            parkPause -= 1
+            cat.set(parkPause > 12 && napFrame % 40 < 12 ? .scratchSelf : .idle, napFrame)
+            return
+        }
+        let s = min(max(sleepiness, 0.25), 2)
+        let pace = 0.6 + 0.5 * (1 - min(s, 1))                 // Rarely: a real run
+        cat.position.x += parkDir * cat.speed * pace
+        if cat.position.x <= r.lowerBound || cat.position.x >= r.upperBound {
+            cat.position.x = min(max(cat.position.x, r.lowerBound), r.upperBound)
+            parkDir = -parkDir                                   // the end: turn around
+            parkPause = 3 + random(8)
+        } else if random(Int(25 + 30 / s)) == 0 {
+            parkPause = Int(CGFloat(10 + random(30)) * max(0.5, s))
+            if random(3) == 0 { parkDir = -parkDir }
+        }
+        catBody.pos = cat.position
+        cat.set(parkDir > 0 ? .E : .W, napFrame)
+    }
+
     private mutating func startFalling(velocity v: CGVector) {
         userLaunched = false
+        dropInside = nil
         lastThrow = .zero
         launchY = cat.position.y
         rising = v.dy > 0
@@ -1647,8 +2106,24 @@ struct Playground {
     // MARK: - Nap spots
 
     private mutating func maybeStartNap(_ world: World) {
-        guard !gravityMode, cat.sleepEnabled, cat.idleTime > 30, cat.idleAnimation == nil, random(sleepy ? 100 : 250) == 0,
+        let odds = Int(CGFloat(sleepy ? 100 : 250) / max(sleepiness, 0.05))
+        guard !gravityMode, cat.sleepEnabled, cat.idleTime > 30, cat.idleAnimation == nil, random(odds) == 0,
               let spot = chooseSpot(world) else { return }
+        // Up to the menu bar or a title bar: a sleepy cat goes up there to nap, a wide-awake
+        // one would rather run around up there.
+        if explores, CGFloat(random(100)) >= min(1, 0.5 * sleepiness) * 100 {
+            var outing: Outing?
+            switch spot.kind {
+            case .menuBar: outing = menuBarOuting(world)
+            case .window: outing = windowOuting(world)
+            default: break
+            }
+            if let o = outing {
+                napFrame = 0
+                mode = .exploring(o)
+                return
+            }
+        }
         mode = .goingToSpot(spot)
     }
 
@@ -1724,6 +2199,293 @@ struct Playground {
         return nil
     }
 
+    // MARK: - Exploring
+
+    /// Left alone a while: now and then it sets off up a window or along the menu bar.
+    private mutating func maybeExplore(_ world: World) {
+        guard explores, !gravityMode, !laser, cat.idleTime > 40, cat.idleAnimation == nil, random(300) == 0 else { return }
+        var options: [Outing] = []
+        if let o = windowOuting(world) { options += [o, o] }
+        if let o = insideOuting(world) { options += [o, o] }
+        if let o = menuBarOuting(world) { options.append(o) }
+        guard !options.isEmpty else { return }
+        napFrame = 0
+        mode = .exploring(options[random(options.count)])
+    }
+
+    /// One of the nearest big windows whose title bar it can get up onto.
+    private func windowOuting(_ world: World) -> Outing? {
+        let p = cat.position, hw = catShape.halfW
+        var picks: [(Outing, CGFloat)] = []
+        for (i, w) in world.windows.prefix(8).enumerated() {
+            let f = w.frame
+            guard f.width >= 200, f.height >= 120,
+                  !world.isCovered(CGPoint(x: f.midX, y: f.maxY - 2), inFrontOf: i),
+                  let s = world.screen(containing: CGPoint(x: f.midX, y: f.maxY - 2)),
+                  f.maxY + 2 * cat.halfSize <= s.visible.maxY + 4
+            else { continue }
+            // Climb the side nearest the cat, if there's room beside it on the screen.
+            let sides: [CGFloat] = abs(p.x - f.minX) <= abs(p.x - f.maxX) ? [-1, 1] : [1, -1]
+            guard let side = sides.first(where: {
+                let x = $0 < 0 ? f.minX - hw : f.maxX + hw
+                return s.frame.insetBy(dx: hw, dy: 0).contains(CGPoint(x: x, y: f.maxY - 2))
+            }) else { continue }
+            let x = side < 0 ? f.minX - hw : f.maxX + hw
+            let o = Outing(place: .window(w.id), side: side, ticksLeft: strollTicks(80 + random(160)), dir: -side, cursorAtStart: .zero)
+            picks.append((o, hypot(x - p.x, f.maxY - p.y)))
+        }
+        guard !picks.isEmpty else { return nil }
+        picks.sort { $0.1 < $1.1 }
+        var o = picks[random(min(3, picks.count))].0
+        o.cursorAtStart = lastCursor
+        return o
+    }
+
+    private func menuBarOuting(_ world: World) -> Outing? {
+        guard menuBarY(world) != nil else { return nil }
+        return Outing(place: .menuBar, ticksLeft: strollTicks(100 + random(200)), dir: random(2) == 0 ? 1 : -1,
+                      cursorAtStart: lastCursor)
+    }
+
+    /// How long it strolls about up there: longer the more awake it is.
+    private func strollTicks(_ n: Int) -> Int { Int(CGFloat(n) * (1.5 - 0.25 * min(sleepiness, 2))) }
+
+    /// At the end of a stroll up on the menu bar or a title bar, the chance it curls up for a
+    /// nap there (else it carries on with its day): Rarely ~4 %, Now and Then ~11 %, Often
+    /// 30 %, Very Sleepy ~85 %.
+    var outingNapChance: CGFloat { min(0.9, 0.3 * pow(max(sleepiness, 0), 1.5)) }
+
+    /// Where its centre sits walking along the menu bar of the display it's on (nil: hidden
+    /// menu bar, or too big a cat).
+    private func menuBarY(_ world: World) -> (y: CGFloat, screen: CGRect)? {
+        guard catScale <= 1, let s = world.screen(containing: cat.position) ?? world.screens.first,
+              s.frame.maxY - s.visible.maxY >= 18 else { return nil }
+        return (min(s.visible.maxY + catShape.halfH - catShape.foot, s.frame.maxY - catShape.halfH + 3 * scale), s.frame)
+    }
+
+    /// One tick of an outing. False when it's over (`mode` says what's next).
+    private mutating func explore(_ o: inout Outing, _ world: World) -> Bool {
+        let hw = catShape.halfW, lift = catShape.halfH - catShape.foot
+        napFrame += 1
+        // The surface it strolls along: a title bar or the menu bar.
+        var minX: CGFloat, maxX: CGFloat, y: CGFloat
+        switch o.place {
+        case .window(let id):
+            guard let f = world.window(id)?.frame else {
+                // The window closed (or went away) under it.
+                if o.stage == .approach { mode = .chasing } else { startFalling(velocity: .zero) }
+                return false
+            }
+            minX = f.minX + hw; maxX = f.maxX - hw; y = f.maxY + lift
+            let edgeX = o.side < 0 ? f.minX - hw : f.maxX + hw
+            switch o.stage {
+            case .approach:
+                // Over to the window's side, at the height it's at (never below the window).
+                let baseY = min(max(cat.position.y, f.minY + catShape.halfH), f.maxY - catShape.halfH)
+                if cat.walk(to: CGPoint(x: edgeX, y: baseY)) {
+                    if scratchesWindows {
+                        o.stage = .scratch
+                        o.scratch = 15 + random(20)
+                    } else {
+                        o.stage = .climb
+                    }
+                }
+                return true
+            case .scratch:
+                // A good scratch at the window's edge first.
+                cat.position.x = edgeX
+                cat.set(o.side < 0 ? .scratchWallE : .scratchWallW, napFrame)
+                o.scratch -= 1
+                if o.scratch <= 0 { o.stage = .climb; events.append(.scratched) }
+                return true
+            case .climb:
+                // Paws on the window's edge, up it goes.
+                cat.position.x = edgeX
+                cat.position.y += cat.speed * 0.45
+                cat.set(o.side < 0 ? .scratchWallE : .scratchWallW, napFrame / 2)
+                if cat.position.y >= f.maxY - catShape.halfH * 0.4 {
+                    // Over the top and onto the title bar.
+                    cat.position = CGPoint(x: o.side < 0 ? minX + 2 * scale : maxX - 2 * scale, y: y)
+                    o.stage = .stroll
+                    o.pause = 8
+                }
+                return true
+            case .stroll: break
+            }
+        case .inside(let id):
+            guard let f = world.window(id)?.frame, let loop = insideLoop(f) else {
+                if o.stage == .approach { mode = .chasing } else { startFalling(velocity: .zero) }
+                return false
+            }
+            return walkInside(&o, id: id, loop)
+        case .menuBar:
+            guard let (my, sf) = menuBarY(world) else { mode = .chasing; return false }
+            minX = sf.minX + hw; maxX = sf.maxX - hw; y = my
+            if o.stage != .stroll {
+                let target = CGPoint(x: min(max(cat.position.x, minX), maxX), y: y)
+                if cat.walk(to: target) { o.stage = .stroll; o.pause = 6 }
+                return true
+            }
+        }
+
+        // Strolling along the top.
+        guard maxX > minX else { mode = .chasing; return false }
+        cat.position.y = y
+        if o.ticksLeft <= 0 {
+            // Done: a nap up here now and then, or back to you.
+            if cat.sleepEnabled && CGFloat(random(100)) < outingNapChance * 100 {
+                let kind: NapSpot.Kind
+                if case .window(let id) = o.place { kind = .window(id) } else { kind = .menuBar }
+                napFrame = 0
+                mode = .napping(NapSpot(kind: kind, point: cat.position), ticksLeft: Int(CGFloat(300 + random(600)) * napLength))
+            } else {
+                mode = .chasing
+                cat.wakeUp()
+            }
+            return false
+        }
+        o.ticksLeft -= 1
+        // A sleepy cat ambles and sits about a lot; a wide-awake one runs up and down.
+        let s = min(max(sleepiness, 0.25), 2)
+        if o.pause > 0 {
+            o.pause -= 1
+            if o.pause > 12 && napFrame % 40 < 12 { cat.set(.scratchSelf, napFrame) }
+            else if s >= 1.5 && o.pause > 8 { cat.set(.tired, 0) }   // a big yawn
+            else { cat.set(.idle, 0) }
+            return true
+        }
+        let pace = 0.5 + 0.6 * (1 - min(s, 1))                     // Often: 0.5× … Rarely: 0.95×
+        cat.position.x += o.dir * cat.speed * pace
+        if cat.position.x <= minX || cat.position.x >= maxX {
+            cat.position.x = min(max(cat.position.x, minX), maxX)
+            o.dir = -o.dir                                   // the end: turn around
+            o.pause = 4 + random(8)
+        } else if random(Int(20 + 30 / s)) == 0 {
+            o.pause = Int(CGFloat(10 + random(30)) * max(0.5, s))   // stop and look about
+            if random(3) == 0 { o.dir = -o.dir }
+        }
+        cat.set(o.dir > 0 ? .E : .W, pace > 0.7 ? napFrame : napFrame / 2)   // (a quicker step when running)
+        return true
+    }
+
+    // MARK: - Inside a window's border
+
+    /// Roughly how tall a title bar is: walking round the inside, it keeps its head under it.
+    static let titleBar: CGFloat = 28
+
+    /// The loop it walks round the inside of window `f`: x from `x0` to `x1`, its centre at
+    /// `yb` along the bottom (feet on the bottom edge) and `yt` along the top (head just under
+    /// the title bar). Nil if the window's too small.
+    struct Loop: Equatable { var x0, x1, yb, yt: CGFloat }
+    func insideLoop(_ f: CGRect) -> Loop? {
+        let hw = catShape.halfW
+        let l = Loop(x0: f.minX + hw, x1: f.maxX - hw, yb: f.minY + catShape.halfH - catShape.foot,
+                     yt: f.maxY - Self.titleBar * scale - catShape.halfH)
+        guard l.x1 - l.x0 > 6 * hw, l.yt - l.yb > 3 * catShape.halfH else { return nil }
+        return l
+    }
+
+    /// 0 the bottom, 1 the right side (going up), 2 the top (going left), 3 the left side
+    /// (going down).
+    static func loopSegment(_ along: CGFloat, _ l: Loop) -> Int {
+        let w = l.x1 - l.x0, h = l.yt - l.yb, a = loopWrap(along, l)
+        return a < w ? 0 : a < w + h ? 1 : a < 2 * w + h ? 2 : 3
+    }
+
+    private static func loopWrap(_ along: CGFloat, _ l: Loop) -> CGFloat {
+        let p = 2 * ((l.x1 - l.x0) + (l.yt - l.yb))
+        let a = along.truncatingRemainder(dividingBy: p)
+        return a < 0 ? a + p : a
+    }
+
+    static func loopPoint(_ along: CGFloat, _ l: Loop) -> CGPoint {
+        let w = l.x1 - l.x0, h = l.yt - l.yb, a = loopWrap(along, l)
+        if a < w { return CGPoint(x: l.x0 + a, y: l.yb) }
+        if a < w + h { return CGPoint(x: l.x1, y: l.yb + (a - w)) }
+        if a < 2 * w + h { return CGPoint(x: l.x1 - (a - w - h), y: l.yt) }
+        return CGPoint(x: l.x0, y: l.yt - (a - 2 * w - h))
+    }
+
+    /// One of the nearest big windows it can walk round the inside of (all of it in view).
+    private func insideOuting(_ world: World) -> Outing? {
+        let p = cat.position
+        var picks: [(Outing, CGFloat)] = []
+        for (i, w) in world.windows.prefix(8).enumerated() {
+            guard w.frame.width >= 320, w.frame.height >= 220, let l = insideLoop(w.frame) else { continue }
+            let corners = [CGPoint(x: l.x0, y: l.yb), CGPoint(x: l.x1, y: l.yb), CGPoint(x: l.x1, y: l.yt), CGPoint(x: l.x0, y: l.yt)]
+            guard corners.allSatisfy({ !world.isCovered($0, inFrontOf: i) && world.screen(containing: $0) != nil })
+            else { continue }
+            let along = min(max(p.x - l.x0, 0), l.x1 - l.x0)        // in at the bottom, below where it is
+            let o = Outing(place: .inside(w.id), ticksLeft: strollTicks(150 + random(250)),
+                           dir: random(2) == 0 ? 1 : -1, cursorAtStart: lastCursor, along: along)
+            picks.append((o, hypot(l.x0 + along - p.x, l.yb - p.y)))
+        }
+        guard !picks.isEmpty else { return nil }
+        picks.sort { $0.1 < $1.1 }
+        return picks[random(min(3, picks.count))].0
+    }
+
+    /// Round the inside of the window's border: along the bottom, up the side, along under
+    /// the title bar, down the other side. It sits about (and scratches the corners) on the
+    /// bottom edge, and may nap there.
+    private mutating func walkInside(_ o: inout Outing, id: Int, _ l: Loop) -> Bool {
+        let w = l.x1 - l.x0
+        if o.stage != .stroll {
+            if cat.walk(to: Self.loopPoint(o.along, l)) { o.stage = .stroll; o.pause = 6 }
+            return true
+        }
+        let seg = Self.loopSegment(o.along, l)
+        if o.ticksLeft <= 0, seg == 0 {
+            // Done, back on the bottom edge: a nap in the corner of the window now and then.
+            if cat.sleepEnabled && CGFloat(random(100)) < outingNapChance * 100 {
+                napFrame = 0
+                mode = .napping(NapSpot(kind: .window(id), point: cat.position),
+                                ticksLeft: Int(CGFloat(300 + random(600)) * napLength))
+            } else {
+                mode = .chasing
+                cat.wakeUp()
+            }
+            return false
+        }
+        o.ticksLeft -= 1
+        cat.position = Self.loopPoint(o.along, l)
+        if o.scratch > 0 {
+            o.scratch -= 1
+            let a = Self.loopWrap(o.along, l)
+            cat.set(a < w / 2 ? .scratchWallW : .scratchWallE, napFrame)
+            if o.scratch == 0 { events.append(.scratched) }
+            return true
+        }
+        if o.pause > 0, seg == 0 {
+            o.pause -= 1
+            if o.pause > 12 && napFrame % 40 < 12 { cat.set(.scratchSelf, napFrame) } else { cat.set(.idle, 0) }
+            return true
+        }
+        let s = min(max(sleepiness, 0.25), 2)
+        let pace = 0.5 + 0.6 * (1 - min(s, 1))
+        let wasOnBottom = seg == 0
+        if !wasOnBottom { o.cornerDone = false }
+        o.along += o.dir * cat.speed * pace
+        if wasOnBottom, Self.loopSegment(o.along, l) != 0, !o.cornerDone {
+            o.cornerDone = true
+            if scratchesWindows, random(3) == 0 {
+                // Reached a bottom corner: stop right in it and give the window's edge a scratch.
+                o.along = o.dir > 0 ? w - 0.01 : 0
+                o.scratch = 15 + random(20)
+            }
+        }
+        cat.position = Self.loopPoint(o.along, l)
+        switch Self.loopSegment(o.along, l) {
+        case 0:
+            cat.set(o.dir > 0 ? .E : .W, napFrame / 2)
+            if o.scratch == 0, random(Int(20 + 30 / s)) == 0 { o.pause = Int(CGFloat(10 + random(30)) * max(0.5, s)) }
+        case 1: cat.set(.scratchWallE, napFrame / 2)        // paws on the right edge
+        case 2: cat.set(o.dir > 0 ? .W : .E, napFrame / 2)  // along under the title bar
+        default: cat.set(.scratchWallW, napFrame / 2)       // paws on the left edge
+        }
+        return true
+    }
+
     // MARK: - Food
 
     /// (A plain loop over a local copy of the bowls: closures mentioning `cat` would copy the
@@ -1749,6 +2511,23 @@ struct Playground {
     /// Put bowl `index` at `p`.
     mutating func placeBowl(at p: CGPoint, falling: Bool, index: Int = 0) {
         toys.placeBowl(index, at: p, falling: falling)
+    }
+
+    /// Eating from bowl `i`, or on its way to it.
+    func usesBowl(_ i: Int) -> Bool {
+        switch mode {
+        case .goingToBowl(let j), .eating(let j, _): return i == j
+        default: return false
+        }
+    }
+
+    /// Bowl `i` was cleared away (the ones after it move down one).
+    mutating func bowlRemoved(_ i: Int) {
+        switch mode {
+        case .goingToBowl(let j): mode = j == i ? .chasing : .goingToBowl(j > i ? j - 1 : j)
+        case .eating(let j, let left): mode = j == i ? .chasing : .eating(j > i ? j - 1 : j, ticksLeft: left)
+        default: break
+        }
     }
 
     mutating func removeBowls(keeping n: Int) {
@@ -1818,6 +2597,9 @@ struct Playground {
         yarnIndex = i
         batYarn()
     }
+
+    /// How much faster catnip zoomies run than a normal chase (0.6.5: twice the old 3×).
+    static let catnipSpeed: CGFloat = 6
 
     /// Catnip: zoomies for ~12 seconds.
     mutating func giveCatnip() {
@@ -1943,7 +2725,7 @@ struct Playground {
         let dx = target.x - cat.position.x
         let moving = abs(dx) > 6 && !walkArrived
         let speed = cat.speed * 10 * (walkGoal == .bone ? 1.3 : 1)   // same pace as classic oneko
-            * (zoomBoost > 0 ? 3 : 1) * (laser ? 2.2 : 1)
+            * (zoomBoost > 0 ? Self.catnipSpeed : 1) * (laser ? 2.2 : 1)
         catBody.pos = cat.position
         catBody.vel.dx = moving ? (dx > 0 ? speed : -speed) : 0
         if moving { hopOntoBox(toward: dx, target: target) }
@@ -1996,6 +2778,77 @@ struct Playground {
                 walkGoal = .cursor
             }
         }
+    }
+
+    // MARK: - Bumping into other cats
+
+    /// How a cat takes part in bumping into other cats.
+    enum BodyKind: Equatable {
+        case none        // napping, in a box, eating, held, clipped…: others pass by
+        case free        // up and about: pushed apart from others any way
+        case surface     // on a window, the Dock, the menu bar, the ground: pushed only sideways
+        case flying      // thrown or knocked: knocks into others
+    }
+
+    var bodyKind: BodyKind {
+        if inBox { return .none }
+        switch mode {
+        case .chasing, .petted, .stretching, .goingToSpot, .fetching, .returningBone, .chasingYarn,
+             .zoomies, .goingToBowl:
+            return .free
+        case .dazed(_, let w): return w == nil ? .free : .surface
+        case .staying, .walking: return .surface
+        case .exploring(let o):
+            switch o.stage {
+            case .approach: return .free
+            case .stroll: return .surface
+            case .scratch, .climb: return .none
+            }
+        case .flying: return .flying
+        default: return .none
+        }
+    }
+
+    /// How close two cats get before they bump (centre to centre, for this cat's share).
+    var bumpRadius: CGFloat { catShape.halfW * 0.85 }
+
+    /// Pushed by another cat it's bumped into (sideways only on a surface).
+    mutating func shove(_ d: CGVector) {
+        switch bodyKind {
+        case .free: cat.position.x += d.dx; cat.position.y += d.dy
+        case .surface: cat.position.x += d.dx
+        case .none, .flying: return
+        }
+        // Never shoved off the display. (A plain loop: this runs for every bumped cat.)
+        var f = lastScreens.first?.frame
+        for s in lastScreens where s.frame.contains(cat.position) { f = s.frame; break }
+        if let f {
+            let hw = catShape.halfW, hh = catShape.halfH, p = cat.position
+            cat.position = CGPoint(x: min(max(p.x, f.minX + hw), f.maxX - hw), y: min(max(p.y, f.minY + hh), f.maxY - hh))
+        }
+        catBody.pos = cat.position
+        if mode == .walking { walkArrived = false }
+    }
+
+    /// Hit by a flying cat: knocked flying itself. False if it can't be (held, in a box…).
+    @discardableResult
+    mutating func knockedByCat(_ v: CGVector, spin: CGFloat = 1) -> Bool {
+        guard catCanBeHit, !inBox else { return false }
+        if mode == .returningBone || walkGoal == .bringBack { dropBone(falling: true) }
+        walkGoal = .cursor
+        stayWindow = nil
+        let k = Physics.clampSpeed(v)
+        startFalling(velocity: k)
+        catBody.spin = (-k.dx / 150 + CGFloat(random(200) - 100) / 40) * spin
+        if hypot(k.dx, k.dy) > 1500 { angry = true }
+        events.append(.catBump)
+        return true
+    }
+
+    /// A flying cat's new velocity after bumping into another (only while it's flying).
+    mutating func setFlightVelocity(_ v: CGVector) {
+        guard mode == .flying else { return }
+        catBody.vel = Physics.clampSpeed(v)
     }
 
     // MARK: - Toolbox
@@ -2099,6 +2952,13 @@ struct Playground {
     /// The Docks have been read at least once (so the very first tick isn't "it just appeared").
     private var docksSeen = false
 
+    /// Look at the Dock afresh, as on launch: a Dock now under something lifts it on top
+    /// instead of bonking it (the Dock setting went back to "on top").
+    mutating func forgetDocks() {
+        lastDocks = []
+        docksSeen = false
+    }
+
     /// A cat that follows your cursor into a showing Dock gets yeeted up and out of it.
     /// Merely dipping its feet in (chasing a cursor just above the Dock), a Dock appearing
     /// underneath it, or being just after a yeet only nudges it back on top, so it never
@@ -2180,21 +3040,9 @@ struct Playground {
             case .held, .flying, .landing, .pinned, .captured, .erased: grounded = false
             default: grounded = !inBox && catWindow == nil
             }
-            var moving = false
-            switch mode {
-            case .chasing, .goingToSpot, .fetching, .returningBone, .walking: moving = true
-            default: break
-            }
-            // Following your cursor into the Dock: the moment it touches the Dock (even just
-            // standing on top of it, waiting above your cursor), it's yeeted.
-            if grounded, moving, wasThere, dockCooldown == 0, d.contains(world.cursor),
-               feetIn(cat.position, catShape, margin: -3) {
-                let v = out()
-                startFalling(velocity: v)
-                catBody.spin = -v.dx / 150 + CGFloat(random(200) - 100) / 30
-                dockCooldown = 20              // 2 s of grace
-                events.append(.dockYeet)
-            } else if grounded, popBonk, dockCooldown == 0, feetIn(cat.position, catShape) {
+            // (Following your cursor into the Dock used to yeet it up and out. Now it stands on
+            // top of the Dock and waits there; set the Dock to "ground" to walk in front of it.)
+            if grounded, popBonk, dockCooldown == 0, feetIn(cat.position, catShape) {
                 let v = out()
                 startFalling(velocity: v)
                 catBody.spin = -v.dx / 150 + CGFloat(random(200) - 100) / 30
@@ -2204,7 +3052,7 @@ struct Playground {
                 cat.position = onTop(cat.position, catShape)   // just a dip: back on top
                 catBody.pos = cat.position
             }
-            let launchProps = wasThere || popBonk
+            let launchProps = popBonk
             func shove(_ p: inout Prop, spin: Int) {
                 guard p.isResting, feetIn(p.body.pos, p.shape, margin: 2 * scale) else { return }
                 if launchProps {
@@ -2241,7 +3089,13 @@ struct Playground {
         if id < 0 { return world.drawing(id) != nil ? .zero : nil }   // drawings don't move
         guard let now = world.window(id)?.frame else { return nil }
         guard let old = lastWindows[id] else { return .zero }
-        return CGVector(dx: now.minX - old.minX, dy: now.maxY - old.maxY)
+        // Parked inside a window, on its bottom edge: it rides that edge (a resize moves it).
+        var inside = false
+        switch mode {
+        case .staying, .dazed: inside = stayInside
+        default: break
+        }
+        return CGVector(dx: now.minX - old.minX, dy: inside ? now.minY - old.minY : now.maxY - old.maxY)
     }
 
     /// A window flicked upward (or yanked hard) while something sits on it launches it.
@@ -2413,6 +3267,7 @@ struct Playground {
         case .napping(let s, _): if case .window(let id) = s.kind { return id }
         case .dazed(_, let w): return w
         case .staying: return stayWindow
+        case .exploring(let o): return o.windowID
         default: break
         }
         return nil
@@ -2539,4 +3394,8 @@ extension Playground {
     static func isPlaying(_ p: inout Playground) -> Bool { p.isPlaying }
     static func catScale(_ p: inout Playground) -> CGFloat { p.catScale }
     static func inBigBox(_ p: inout Playground) -> Bool { p.inBigBox }
+    static func usesBowl(_ p: inout Playground, _ i: Int) -> Bool { p.usesBowl(i) }
+    static func body(_ p: inout Playground) -> (pos: CGPoint, kind: Playground.BodyKind) { (p.cat.position, p.bodyKind) }
+    static func velocity(_ p: inout Playground) -> CGVector { p.catBody.vel }
+    static func bumpRadius(_ p: inout Playground) -> CGFloat { p.bumpRadius }
 }

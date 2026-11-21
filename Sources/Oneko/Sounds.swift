@@ -1,8 +1,9 @@
 import AppKit
 
-/// Neko's noises, synthesised in code at first use (no audio files): a purr for pets, a
-/// mrrp for yeets and box hops, a meow on waking, a thud on hard landings, a sleepy
-/// sigh when it dozes off, and thunder rolling in a storm.
+/// Neko's noises: a purr for pets, a mrrp for yeets and box hops, a meow on waking, a thud
+/// on hard landings, a sleepy sigh when it dozes off, and thunder rolling in a storm. All
+/// synthesised in code at first use, except the meow (0.6.5): a real recording,
+/// `Resources/meow.m4a` (the synthesised one if that's missing).
 final class SoundBox {
     enum Kind: CaseIterable { case purr, meow, mrrp, thud, sleep, thunder }
 
@@ -44,8 +45,15 @@ final class SoundBox {
     /// 16-bit mono WAV data.
     static func wavData(_ samples: [Float]) -> Data { wav(samples) }
 
+    /// The recorded meow in the app bundle, if it's there.
+    static var recordedMeow: URL? { Bundle.main.url(forResource: "meow", withExtension: "m4a") }
+
     private func sound(_ kind: Kind) -> NSSound {
         if let s = sounds[kind] { return s }
+        if kind == .meow, let url = Self.recordedMeow, let s = NSSound(contentsOf: url, byReference: false) {
+            sounds[kind] = s
+            return s
+        }
         let samples = Self.samples(kind)
         let s = NSSound(data: Self.wav(samples)) ?? NSSound()
         sounds[kind] = s

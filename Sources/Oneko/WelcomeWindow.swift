@@ -98,6 +98,15 @@ final class WelcomeWindow: NSPanel {
 final class WhatsNewWindow: NSPanel {
     /// The newest release first. Add an entry for every release.
     static let releases: [(version: String, items: [(symbol: String, title: String, text: String)])] = [
+        ("0.6.5", [
+            ("figure.climbing", "Off exploring", "Leave the mouse alone and a cat may climb up a window and stroll along its title bar, walk round the inside of a window's border, or run along the menu bar, scratching window edges on the way. Move the mouse and it comes running."),
+            ("moon.zzz", "Less sleepy", "Cats nap less by default. Put one on a window, the Dock or the menu bar, or drop it inside a window, and it runs up and down there instead of dozing off. Pick how sleepy they are under Sleepiness in the menu bar menu."),
+            ("dock.rectangle", "The Dock, your way", "Cats no longer get launched out of the Dock when they follow your cursor into it. They stand on top of it, or walk on the ground in front of it (Settings › Behavior)."),
+            ("circle.grid.cross", "Cats bump into each other", "They don't walk through each other any more, and a cat you throw into another knocks it flying. Want it wilder? Settings › Cats › Bumping: Crazy, or Total Chaos (pinball)."),
+            ("person.crop.square", "Names and sizes for each cat", "Name every cat, and give the first 10 their own size (1×, 2× or 3×) under Settings › Cats › Names and Sizes."),
+            ("fork.knife", "Dinner's served", "Click a bowl (or Toys › Feed the Cats) and every cat comes to eat, hungry or not. A fish bobs over a cat while it eats, and the bowl is cleared away when they're done. The bone is a fish bone now, and catnip runs twice as fast."),
+            ("wrench.and.screwdriver", "Fixes", "A real meow. Trips to the Touch Bar no longer leave a box on the desktop, cats lift out of the big box properly, and the Settings counts no longer lag behind."),
+        ]),
         // 0.6.0 is the first release since 0.5.5, so it sums up 0.5.7 and 0.5.8 too (only the
         // newest entry is shown).
         ("0.6.0", [

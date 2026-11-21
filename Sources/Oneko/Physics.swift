@@ -16,6 +16,21 @@ struct ScreenInfo: Equatable {
         }
         return visible.minY
     }
+
+    /// The Dock as no floor at all: cats and toys walk and land on the real bottom (or side)
+    /// of the display, in front of the Dock.
+    var dockIgnored: ScreenInfo {
+        guard let d = dock else { return self }
+        var v = visible
+        if d.minY <= frame.minY + 1 && d.width >= d.height {          // bottom Dock
+            v = CGRect(x: v.minX, y: frame.minY, width: v.width, height: v.maxY - frame.minY)
+        } else if d.minX <= frame.minX + 1 {                           // left Dock
+            v = CGRect(x: frame.minX, y: v.minY, width: v.maxX - frame.minX, height: v.height)
+        } else if d.maxX >= frame.maxX - 1 {                           // right Dock
+            v = CGRect(x: v.minX, y: v.minY, width: frame.maxX - v.minX, height: v.height)
+        }
+        return ScreenInfo(frame: frame, visible: v, dock: nil)
+    }
 }
 
 struct WindowInfo: Equatable {
@@ -40,6 +55,13 @@ struct World {
     var drawings: [Drawing] = []
 
     func drawing(_ id: Int) -> Drawing? { drawings.first { $0.id == id } }
+
+    /// This world with the Dock treated as not there (Settings › Behavior › Dock: on the ground).
+    func ignoringDock() -> World {
+        var w = self
+        w.screens = screens.map(\.dockIgnored)
+        return w
+    }
 
     var screenFrames: [CGRect] { screens.map(\.frame) }
 
@@ -113,7 +135,9 @@ enum Physics {
         return CGVector(dx: v.dx / s * m, dy: v.dy / s * m)
     }
 
-    static func step(_ b: inout Body, shape: Shape, dt: CGFloat, world: World) -> StepResult {
+    /// `inside`: a window it was dropped into: its inside bottom edge is a floor and its sides
+    /// are walls (until it leaves through the top).
+    static func step(_ b: inout Body, shape: Shape, dt: CGFloat, world: World, inside: Int? = nil) -> StepResult {
         guard let cur = world.screen(containing: b.pos) ?? world.nearestScreen(to: b.pos) else { return .flying }
         b.airTime += dt
         b.vel.dy -= gravity * dt
@@ -143,6 +167,14 @@ enum Physics {
             b.vel.dy = -abs(b.vel.dy) * 0.5
         }
 
+        // Dropped into a window: its sides keep it in, its bottom edge catches it.
+        var innerFloor: (y: CGFloat, id: Int)?
+        if let id = inside, let w = world.window(id)?.frame, next.y - shape.halfH < w.maxY {
+            if next.x - shape.halfW < w.minX { next.x = w.minX + shape.halfW; b.vel.dx = abs(b.vel.dx) * 0.6; b.spin = -b.spin * 0.7 }
+            if next.x + shape.halfW > w.maxX { next.x = w.maxX - shape.halfW; b.vel.dx = -abs(b.vel.dx) * 0.6; b.spin = -b.spin * 0.7 }
+            innerFloor = (w.minY, id)
+        }
+
         // Drawn shapes: solid lines that bounce things and catch them on gentle slopes.
         if let hit = collideDrawings(&b, &next, shape: shape, dt: dt, world: world) { return hit }
 
@@ -153,6 +185,10 @@ enum Physics {
             let floorScreen = world.screen(containing: CGPoint(x: next.x, y: max(next.y, f.minY))) ?? cur
             let floor = floorScreen.floor(at: next.x)
             var landing: (y: CGFloat, window: Int?)? = feetAfter <= floor ? (floor, nil) : nil
+            if let inner = innerFloor {
+                let edge = inner.y, best = landing?.y ?? -.infinity
+                if feetBefore >= edge - 0.5 && feetAfter < edge && edge > best { landing = (edge, inner.id) }
+            }
             for (i, w) in world.windows.enumerated() where next.x >= w.frame.minX && next.x <= w.frame.maxX {
                 let top = w.frame.maxY
                 let best = landing?.y ?? -.infinity

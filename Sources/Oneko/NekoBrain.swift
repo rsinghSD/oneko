@@ -46,6 +46,9 @@ struct NekoBrain {
     var paused = false
     /// Whether "sleeping" is one of the random idle animations.
     var sleepEnabled = true
+    /// How sleepy, relative to classic oneko (1): how likely an idle moment ends in a doze,
+    /// and how long the doze lasts.
+    var sleepiness: CGFloat = 1
     /// Half the cat's on-screen size: 16 at 1×. Distances below scale with it,
     /// matching oneko.js at 1× (stop at 48, walls at 32, keep 16 from the edge).
     var halfSize: CGFloat = 16
@@ -156,14 +159,21 @@ struct NekoBrain {
         idleTime += 1
 
         if idleTime > 10, random(200) == 0, idleAnimation == nil {
-            var choices: [SpriteName] = sleepEnabled ? [.sleeping, .scratchSelf] : [.scratchSelf]
+            var choices: [SpriteName] = [.scratchSelf]
             if let s = screen(containing: position, in: screens) {
                 if position.x < s.minX + wallMargin { choices.append(.scratchWallW) }
                 if position.x > s.maxX - wallMargin { choices.append(.scratchWallE) }
                 if allowVerticalWalls, position.y > s.maxY - wallMargin { choices.append(.scratchWallN) }
                 if allowVerticalWalls, position.y < s.minY + wallMargin { choices.append(.scratchWallS) }
             }
-            idleAnimation = choices[random(choices.count)]
+            // Classic oneko: a doze is one of the choices, as likely as all the others together
+            // when there are no walls. Sleepiness scales that.
+            let dozeChance = min(0.9, Double(sleepiness) / Double(choices.count + 1))
+            if sleepEnabled && Double(random(1000)) < dozeChance * 1000 {
+                idleAnimation = .sleeping
+            } else {
+                idleAnimation = choices[random(choices.count)]
+            }
         }
 
         switch idleAnimation {
@@ -172,7 +182,7 @@ struct NekoBrain {
                 set(.tired, 0)
             } else {
                 set(.sleeping, idleAnimationFrame / 4)
-                if idleAnimationFrame > 192 { resetIdleAnimation() }
+                if idleAnimationFrame > 8 + Int(184 * min(1.5, max(0.3, sleepiness))) { resetIdleAnimation() }
             }
         case .scratchSelf, .scratchWallN, .scratchWallS, .scratchWallE, .scratchWallW:
             set(idleAnimation!, idleAnimationFrame)

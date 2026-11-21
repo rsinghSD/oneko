@@ -133,6 +133,8 @@ final class CatRig {
     private let bone = OverlayPanel.pixelLayer()
     private let anger = OverlayPanel.pixelLayer()
     private let clip = OverlayPanel.pixelLayer()
+    private let eat = OverlayPanel.pixelLayer()
+    private var eatShown = false
     private let hat = OverlayPanel.pixelLayer()     // child of the sprite: tilts and spins with it
     private var hatArt: Art?
     private var angerShown = false
@@ -142,8 +144,10 @@ final class CatRig {
 
     init() {
         layer.actions = ["position": NSNull(), "bounds": NSNull(), "sublayers": NSNull()]
-        for l in [boxBack, sprite, boxFront, bone, anger, clip] { layer.addSublayer(l) }
+        for l in [boxBack, sprite, boxFront, bone, anger, clip, eat] { layer.addSublayer(l) }
         anger.isHidden = true   // only while it's actually angry
+        eat.isHidden = true
+        eat.contents = PixelArt.eating.image
         clip.isHidden = true
         hat.isHidden = true
         sprite.addSublayer(hat)
@@ -181,6 +185,8 @@ final class CatRig {
         anger.position = CGPoint(x: c.x + 0.3 * spriteSize, y: c.y + 0.42 * spriteSize)
         clip.bounds = CGRect(x: 0, y: 0, width: 7 * scale, height: 11 * scale)
         clip.position = CGPoint(x: c.x + 0.03 * spriteSize, y: c.y + 0.5 * spriteSize)   // pinching the scruff
+        eat.bounds = CGRect(x: 0, y: 0, width: CGFloat(PixelArt.eating.width) * scale, height: CGFloat(PixelArt.eating.height) * scale)
+        eat.position = CGPoint(x: c.x - 0.28 * spriteSize, y: c.y + 0.5 * spriteSize)
     }
 
     /// Returns false when nothing changed (nothing was sent to the screen).
@@ -219,6 +225,23 @@ final class CatRig {
             let dir = pose.sprite.rawValue
             let dx: CGFloat = dir.hasSuffix("E") ? 0.3 : dir.hasSuffix("W") ? -0.3 : 0
             bone.position = CGPoint(x: side / 2 + dx * spriteSize, y: side / 2 - 0.08 * spriteSize)
+        }
+
+        eat.isHidden = !pose.eating
+        if pose.eating != eatShown {
+            eatShown = pose.eating
+            if pose.eating {
+                // Nom, nom: the fish bobs up and down while it eats.
+                let bob = CABasicAnimation(keyPath: "position.y")
+                bob.fromValue = eat.position.y
+                bob.toValue = eat.position.y + 3 * scale
+                bob.duration = 0.3
+                bob.autoreverses = true
+                bob.repeatCount = .infinity
+                eat.add(bob, forKey: "bob")
+            } else {
+                eat.removeAllAnimations()
+            }
         }
 
         anger.isHidden = !pose.angry

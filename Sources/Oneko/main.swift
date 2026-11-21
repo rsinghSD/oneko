@@ -108,6 +108,7 @@ if let i = CommandLine.arguments.firstIndex(of: "--export-art"), i + 1 < Command
     draw(PixelArt.clip.image, 150 + 16 - 3, 30 + 16 + 8 + 3 - 5, 7, 11)       // clipped box
     draw(PixelArt.heart.image, 112, 50, 7, 6)
     draw(PixelArt.bone.image, 124, 50, 16, 7)
+    draw(PixelArt.eating.image, 144, 50, PixelArt.eating.width, PixelArt.eating.height)
     // Hats on cats (using the head anchor), yarn, laser dot.
     for (i, hat) in [PixelArt.santaHat, PixelArt.witchHat, PixelArt.partyHat].enumerated() {
         let x0 = 150 + i * 40, y0 = 38
