@@ -98,6 +98,8 @@ enum SelfTest {
         toolboxChecks(check)
         touchBarChecks(check)
         extrasChecks(check)
+        displayChecks(check)
+        catCountChecks(check)
 
         print(ok ? "All checks passed." : "Some checks failed.")
         return ok

@@ -4,12 +4,16 @@ struct ScreenInfo: Equatable {
     var frame: CGRect
     /// Frame minus the menu bar and the Dock.
     var visible: CGRect
-    /// The Dock's strip on this display while it's showing (nil when hidden or elsewhere).
+    /// The Dock on this display while it's showing (nil when hidden or elsewhere): the Dock
+    /// itself, from the bottom (or side) of the display to its top, not the whole strip.
     var dock: CGRect? = nil
 
-    /// What falling things land on: the top of a showing bottom Dock, else the bottom.
-    var floor: CGFloat {
-        if let d = dock, d.minY <= frame.minY + 1, d.width >= d.height { return max(visible.minY, d.maxY) }
+    /// What falling things land on at `x`: the top of a showing bottom Dock, or beside it
+    /// the real bottom of the display.
+    func floor(at x: CGFloat) -> CGFloat {
+        if let d = dock, d.minY <= frame.minY + 1, d.width >= d.height {
+            return x >= d.minX && x <= d.maxX ? d.maxY : frame.minY
+        }
         return visible.minY
     }
 }
@@ -144,7 +148,7 @@ enum Physics {
             let feetBefore = b.pos.y - shape.halfH + shape.foot
             let feetAfter = next.y - shape.halfH + shape.foot
             let floorScreen = world.screen(containing: CGPoint(x: next.x, y: max(next.y, f.minY))) ?? cur
-            let floor = floorScreen.floor
+            let floor = floorScreen.floor(at: next.x)
             var landing: (y: CGFloat, window: Int?)? = feetAfter <= floor ? (floor, nil) : nil
             for (i, w) in world.windows.enumerated() where next.x >= w.frame.minX && next.x <= w.frame.maxX {
                 let top = w.frame.maxY

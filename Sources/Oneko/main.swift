@@ -4,9 +4,47 @@ if CommandLine.arguments.contains("--selftest") {
     exit(SelfTest.run() ? 0 : 1)
 }
 
+// `Oneko --diagnose`: what Oneko sees of your displays and the Dock (for bug reports).
+if CommandLine.arguments.contains("--diagnose") {
+    _ = NSApplication.shared
+    let p = WorldReader.dockPrefs()
+    let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+    print("Oneko \(version) on macOS \(ProcessInfo.processInfo.operatingSystemVersionString)")
+    print("Dock settings: edge \(p.edge), autohide \(p.autohide), tile \(Int(p.tile)) pt, delay \(p.delay) s")
+    print("Dock contents: \(p.icons) icons, \(p.separators) separators -> about \(Int(WorldReader.dockLength(p))) pt long")
+    print("Exact Dock size (Accessibility): \(WorldReader.exactDockAllowed ? "allowed" : "not allowed")"
+          + (WorldReader.exactDockFrame().map { ", list frame \($0)" } ?? ""))
+    let world = WorldReader.read()
+    for (s, info) in zip(NSScreen.screens, world.screens) {
+        let strip = WorldReader.dockStrip(frame: s.frame, visible: s.visibleFrame, cursor: world.cursor)
+        print("Display \"\(s.localizedName)\"")
+        print("  frame \(s.frame), visible \(s.visibleFrame)")
+        print("  space kept for the Dock: \(strip.map { "\($0)" } ?? "none")")
+        print("  Dock Oneko uses: \(info.dock.map { "\($0)" } ?? "none")")
+    }
+    exit(0)
+}
+
 guard let sprites = SpriteSheet.load() else {
     FileHandle.standardError.write("Oneko: could not load oneko.gif\n".data(using: .utf8)!)
     exit(1)
+}
+
+// Dev helper: `Oneko --crowd-png out.png` renders 6,000 crowd cats offscreen (real GPU code).
+if let i = CommandLine.arguments.firstIndex(of: "--crowd-png"), i + 1 < CommandLine.arguments.count {
+    let crowd = CrowdController()
+    let screen = CGRect(x: 0, y: 0, width: 1146, height: 480)   // ultrawide-shaped
+    if crowd.selfCheck(count: 6000, sheets: (0..<12).map { sprites.recolored(Skin.random(seed: $0)) } + [sprites],
+                       ticks: 120, cursor: CGPoint(x: 573, y: 240), screen: screen) != nil,
+       let snap = crowd.lastSnapshot {
+        var rgba = snap.pixels
+        for p in stride(from: 0, to: rgba.count, by: 4) { rgba.swapAt(p, p + 2) }   // BGRA -> RGBA
+        if let img = PixelArt.makeImage(rgba, width: snap.width, height: snap.height) {
+            try? NSBitmapImageRep(cgImage: img).representation(using: .png, properties: [:])?
+                .write(to: URL(fileURLWithPath: CommandLine.arguments[i + 1]))
+        }
+    }
+    exit(0)
 }
 
 // Dev helper: `Oneko --export-icon out.png` writes the menu bar icon (2×) for inspection.
@@ -125,7 +163,7 @@ if let i = CommandLine.arguments.firstIndex(of: "--export-settings"), i + 1 < Co
     _ = NSApplication.shared
     NSApp.appearance = NSAppearance(named: .aqua)
     let delegate = AppDelegate(sprites: sprites)
-    let pages: [SettingsPage] = [GeneralPage(), NapsPage(), ToysPage(), SoundsPage(), TouchBarPage(), StatsPage()]
+    let pages: [SettingsPage] = [GeneralPage(), CatsPage(), NapsPage(), ToysPage(), SoundsPage(), TouchBarPage(), StatsPage()]
     for (n, p) in pages.enumerated() {
         p.app = delegate
         let v = p.view

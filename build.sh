@@ -10,13 +10,23 @@ cd "$(dirname "$0")"
 
 VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Resources/Info.plist)
 
+# Compiles with swiftc directly: it's one target with no dependencies, and this way a
+# SwiftPM hiccup (like the manifest hang after the Swift 6.4 update) can't block a build.
+# No whole-module optimization: Swift 6.4.2 hangs on it for this project.
+compile() {   # compile <arch> <output>
+    xcrun swiftc -O -j8 -target "$1-apple-macos13.0" -module-name Oneko \
+        Sources/Oneko/*.swift -o "$2"
+}
+
+mkdir -p build/bin
 if [[ "${1:-}" == "--dmg" ]]; then
-    swift build -c release --arch arm64 --arch x86_64
-    BIN="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/Oneko"
+    compile arm64 build/bin/Oneko-arm64
+    compile x86_64 build/bin/Oneko-x86_64
+    lipo -create build/bin/Oneko-arm64 build/bin/Oneko-x86_64 -output build/bin/Oneko
 else
-    swift build -c release
-    BIN="$(swift build -c release --show-bin-path)/Oneko"
+    compile "$(uname -m)" build/bin/Oneko
 fi
+BIN=build/bin/Oneko
 
 APP=build/Oneko.app
 rm -rf "$APP"

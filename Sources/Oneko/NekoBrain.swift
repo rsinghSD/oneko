@@ -109,7 +109,7 @@ struct NekoBrain {
         var next = position
         next.x -= (diffX / distance) * speed
         next.y += (diffY / distance) * speed
-        position = clamp(next, cursor: cursor, screens: screens)
+        position = move(from: position, to: next, cursor: cursor, screens: screens)
     }
 
     /// Run straight at `target` (nap spots, fetching). Returns true on arrival.
@@ -195,6 +195,56 @@ struct NekoBrain {
 
     private func screen(containing p: CGPoint, in screens: [CGRect]) -> CGRect? {
         screens.first { $0.contains(p) }
+    }
+
+    /// Where a step from `p0` to `p` ends up. The whole cat always stays on one display
+    /// (with separate Spaces per display, macOS can't show a window across two). Heading for
+    /// the cursor's display, it goes through the edge the two share: along its own edge to
+    /// where they meet, then a hop over, never a jump across a corner.
+    func move(from p0: CGPoint, to p: CGPoint, cursor: CGPoint, screens: [CGRect]) -> CGPoint {
+        let m = halfSize
+        if screens.contains(where: { $0.insetBy(dx: m, dy: m).contains(p) }) { return p }
+        guard let target = screen(containing: cursor, in: screens),
+              let here = screens.first(where: { $0.insetBy(dx: m - 0.5, dy: m - 0.5).contains(p0) }),
+              here != target
+        else { return clamp(p, cursor: cursor, screens: screens) }   // same display: slide along its edge
+        let hi = here.insetBy(dx: m, dy: m), ti = target.insetBy(dx: m, dy: m)
+        func inside(_ r: CGRect, _ q: CGPoint) -> CGPoint {
+            CGPoint(x: min(max(q.x, r.minX), r.maxX), y: min(max(q.y, r.minY), r.maxY))
+        }
+        let step = hypot(p.x - p0.x, p.y - p0.y)
+        func walk(to goal: CGPoint) -> CGPoint {
+            let d = hypot(goal.x - p0.x, goal.y - p0.y)
+            guard d > step else { return goal }
+            return CGPoint(x: p0.x + (goal.x - p0.x) / d * step, y: p0.y + (goal.y - p0.y) / d * step)
+        }
+        // Side by side.
+        let leftOf = abs(here.maxX - target.minX) < 1, rightOf = abs(here.minX - target.maxX) < 1
+        if leftOf || rightOf {
+            let lo = max(here.minY, target.minY) + m, up = min(here.maxY, target.maxY) - m
+            if lo <= up {
+                if p0.y >= lo - 0.5 && p0.y <= up + 0.5 {
+                    let crossing = leftOf ? p.x > hi.maxX : p.x < hi.minX
+                    guard crossing else { return inside(hi, p) }
+                    return CGPoint(x: leftOf ? ti.minX : ti.maxX, y: min(max(p.y, lo), up))
+                }
+                return walk(to: CGPoint(x: leftOf ? hi.maxX : hi.minX, y: min(max(p0.y, lo), up)))
+            }
+        }
+        // Stacked.
+        let below = abs(here.maxY - target.minY) < 1, above = abs(here.minY - target.maxY) < 1
+        if below || above {
+            let lo = max(here.minX, target.minX) + m, up = min(here.maxX, target.maxX) - m
+            if lo <= up {
+                if p0.x >= lo - 0.5 && p0.x <= up + 0.5 {
+                    let crossing = below ? p.y > hi.maxY : p.y < hi.minY
+                    guard crossing else { return inside(hi, p) }
+                    return CGPoint(x: min(max(p.x, lo), up), y: below ? ti.minY : ti.maxY)
+                }
+                return walk(to: CGPoint(x: min(max(p0.x, lo), up), y: below ? hi.maxY : hi.minY))
+            }
+        }
+        return inside(ti, p)   // displays that don't share an edge: straight over
     }
 
     /// Keep the whole cat inside a display. If the step would leave every display

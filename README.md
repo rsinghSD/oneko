@@ -27,24 +27,28 @@ Oneko runs on macOS 13 or later, on Apple silicon and Intel. It isn't notarized 
 ./build.sh --dmg       # universal build + build/Oneko-<version>.dmg + Casks/oneko.rb
 ```
 
-It's a Swift package; no Xcode project is needed. `./make-demo.sh` re-renders the demo video from the real engine (needs ffmpeg). `build/Oneko.app/Contents/MacOS/Oneko --selftest` runs the headless self-tests. To see why physics is running, launch it with `ONEKO_DEBUG=1`.
+It's a Swift package (one target, no dependencies), and `build.sh` compiles it with `swiftc` directly; no Xcode project is needed. `./make-demo.sh` re-renders the demo video from the real engine (needs ffmpeg). `build/Oneko.app/Contents/MacOS/Oneko --selftest` runs the headless self-tests, and `--diagnose` prints what Oneko sees of your displays and the Dock (handy for bug reports). To see why physics is running, launch it with `ONEKO_DEBUG=1`.
 
 ## Playing with the cat
 
 - **Pet:** click the cat and a heart pops up. Petting also calms an angry cat.
-- **Stay:** double-click and it sits down and sleeps where it is. Double-click again to wake it.
+New here? **How to Play…** in the menu (shown once on first launch) sums it all up.
+
+- **Stay:** double-click and it sits down and sleeps where it is. Double-click any sleeping cat (staying, parked or off napping) to wake it, and it chases you again. Hover over a sleeping cat and it tells you so.
 - **Drag & yeet:** grab the cat and it hangs off your cursor. It turns with your hand like a Wii remote: circle the mouse and it spins around the cursor in step, hold still and it hangs upright. Let go and it flies off with your throw speed and its spin. It tumbles, bounces off screen edges, and lands on the Dock or on top of a window. Throw it hard and it gets a 💢.
 - **Window juggling:** drag a window into the cat and it gets knocked flying (💢). If the cat is sitting on a window, flick the window up to launch it. Swing a window into a flying cat to bat it, or slide one gently under it to catch it on the title bar, then launch it again.
 - **Fetch:** turn on **Bone** in the menu, then throw the bone or click it for a little toss. A held bone twirls with your hand, just like the cat. The cat runs after it, catches it in mid-air if it can, and carries it back to your cursor.
 - **Cardboard box:** turn on **Cardboard Box** and drag it anywhere. The cat can't resist napping in it, and you can drop or throw the cat straight in. You can even hold the box and catch a thrown cat in it, then carry the cat around. **Right-click** the box to close the flaps. A cat inside stays put (and rattles the box when it wants out), and opening it lets the cat pop out.
 - **Clip it:** right-click the cat to clip it in mid-air with a little clothespin, even mid-throw. Right-click while dragging the cat, the box or the bone to clip it where you're holding it. Right-click a clipped thing to let it drop. (Right-click on a box that isn't clipped or being dragged still opens and closes it.)
 - **Park it:** drop or throw the cat onto the Dock or onto a window (it rides along), or drop it gently into the menu bar (1× size only, since bigger cats don't fit), and it parks there. It sits, dozes off and doesn't move until you pick it up or double-click it.
+- **The real Dock:** Oneko uses the Dock itself, not the whole strip along the bottom of the screen. Things land on top of the Dock, and beside it they fall all the way to the bottom. It works out the Dock's length from its icons; allow Accessibility under **Settings ▸ Behavior ▸ Dock size** and it reads the exact size instead.
 - **The Dock is not a floor:** if you lead the cat into a showing Dock with your cursor, it gets yeeted up and over, and lands on top of the Dock. Just dipping its feet in, or the Dock appearing underneath it, only nudges it back on top. After a yeet there are 3 seconds of grace, so it never loops. An auto-hiding Dock counts only while it's really showing (just as macOS does it: push the cursor against the bottom edge, and it shows until you move away), and anything sitting on top of it falls when it hides.
 - **Nap spots:** when you leave it alone, the cat may wander off for a long nap on a window's title bar (riding along if you move the window, and falling off if you close it), in the menu bar, or on top of the Dock.
 
 ## More cats, toys, coats and hats
 
-- **Cats ▸ 1–5:** extra cats, each in its own coat, follow the one in front of them in a little line. Pet, drag and yeet each one.
+- **Settings ▸ Cats:** anywhere from 0 cats (just the toys) to 10,000 real cats: pet, drag, yeet and park each one. Each real cat is its own little window with its own physics, so past a few hundred your Mac will feel it (Oneko asks before spawning more than 1,000, and they arrive in batches). Extra cats can **swarm** around your cursor (the default), follow each other in a **conga line**, or **roam** free. Their coats can take turns, all match, be random, or be chosen one by one.
+- **Crowd mode** (optional, off by default, the nuts.wad switch): cats past 50 become crowd cats, drawn by the graphics chip, and the count goes up to **1,000,000**. They're light on resources (20,000 of them use about 12% CPU), click-through, and can't be picked up. It gets choppy in the tens of thousands, and at a million the screen is solid cat.
 - **Toys ▸ Ball of Yarn:** it rolls with real physics, and the cat bats it and chases it while it rolls. Throw it, or click it for a nudge.
 - **Toys ▸ Laser Pointer:** a red dot follows your cursor, and the cat dashes after it and pounces.
 - **Toys ▸ Give Catnip:** about 12 seconds of zoomies.
@@ -62,6 +66,7 @@ On a Mac with a Touch Bar, choose **Neko Lives On › Touch Bar** in the menu. N
 It's the same playground in a 30 pt strip, with gravity and a tall invisible sky above it:
 
 - It trots along the bar to the spot under your cursor. **Tap** an empty part of the bar and it runs there instead.
+- Extra cats come along too, up to 50 on the bar (it's about 33 cats wide, so past that they pile up). Each can be petted, flicked and clipped; only the first cat makes trips to the desktop.
 - **Tap** the cat to pet it (hearts; calms a 💢). **Double-tap** to make it stay.
 - **Flick it** to yeet it. The moment it rises even a little above the top of the bar, it leaves the Touch Bar: it flies up out of the bottom of the MacBook's screen, and Neko lives on the desktop again.
 - **Long-press** to clip it in place with the clothespin, and long-press again to let go.
@@ -117,7 +122,9 @@ Settings, the cat's position and the toys' positions are saved between launches.
 | `Sources/Oneko/Settings.swift` | Saved preferences and last position (UserDefaults) |
 | `Sources/Oneko/Playground.swift` | The cat's modes (chase, nap spots, fetch, held Wii-remote style, thrown, staying), toys, window riding and collisions |
 | `Sources/Oneko/Physics.swift` | Gravity, bounces and landings on the Dock and title bars, plus the desktop snapshot (`World`) |
-| `Sources/Oneko/WorldReader.swift` | Reads displays and window positions; needs no Screen Recording permission |
+| `Sources/Oneko/WorldReader.swift` | Reads displays and window positions; and where the Dock really is; needs no Screen Recording permission |
+| `Sources/Oneko/Crowd.swift` | Crowd mode: cats past 50 simulated and drawn on the GPU (Metal), one click-through overlay per display |
+| `Sources/Oneko/WelcomeWindow.swift` | How to Play window, and the "Double-click to wake" hint |
 | `Sources/Oneko/PixelArt.swift` | Hand-made pixel art: 💢, heart, bone, cardboard box |
 | `Sources/Oneko/TouchBarCat.swift` | Touch Bar mode: the playground on the Touch Bar, touch input (private DFRFoundation API) |
 | `Sources/Oneko/Paint.swift` | Paint tools, drawings as solid shapes, geometry |

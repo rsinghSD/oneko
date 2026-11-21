@@ -73,6 +73,17 @@ final class TouchBarCat: NSObject, NSTouchBarDelegate {
     }
     private(set) var play = Playground(position: CGPoint(x: 60, y: 13))
 
+    /// The most cats the bar takes (it's only about 33 cats wide; past that they pile up).
+    static let maxCats = 50
+    /// Cats 2, 3, … on the bar: same playground rules, no toys of their own.
+    private(set) var extras: [Playground] = []
+    private var extraSheets: [SpriteSheet] = []
+    private var behavior: Settings.CatBehavior = .swarm
+    private var roam: [CGFloat] = []
+    /// Count 0: just the toys.
+    private(set) var noCat = false
+    private var touchExtra: Int?
+
     private let icon: NSImage
     private let view = TouchBarCatView()
     private var trayItem: NSCustomTouchBarItem?
@@ -108,7 +119,44 @@ final class TouchBarCat: NSObject, NSTouchBarDelegate {
     }
 
     var isShowing: Bool { view.window != nil }
-    var needsPhysics: Bool { isShowing && play.needsPhysics }
+    var needsPhysics: Bool { isShowing && (play.needsPhysics || extras.contains { $0.needsPhysics }) }
+
+    /// `n` cats in all (0…50), wearing `sheets` (cat 2 first).
+    func setCats(_ n: Int, sheets: [SpriteSheet], behavior b: Settings.CatBehavior) {
+        behavior = b
+        noCat = n == 0
+        extraSheets = sheets
+        let want = max(0, min(n, Self.maxCats) - 1)
+        if extras.count > want { extras.removeLast(extras.count - want) }
+        while extras.count < want {
+            let i = extras.count
+            var p = Playground(position: CGPoint(x: play.cat.position.x + CGFloat(i % 2 == 0 ? 1 : -1) * CGFloat(14 * (i / 2 + 1)), y: 13))
+            p.gravityMode = true
+            p.spotWindows = false; p.spotMenuBar = false; p.spotDock = false
+            p.throwLift = Self.hopLift
+            p.random = { Int.random(in: 0..<max($0, 1)) }
+            extras.append(p)
+        }
+        roam = extras.map { _ in span.minX + CGFloat.random(in: 0...1) * span.width }
+        render()
+        onNeedsPhysics?()
+    }
+
+    func setSheets(_ sheets: [SpriteSheet]) {
+        extraSheets = sheets
+        render()
+    }
+
+    /// Where bar cat `i` (cat 2 is 0) heads, given where the first cat is going.
+    private func target(of i: Int, main x: CGFloat) -> CGFloat {
+        switch behavior {
+        case .conga: return i == 0 ? play.cat.position.x : extras[i - 1].cat.position.x
+        case .swarm: return x + AppDelegate.swarmOffset(i, scale: 1).dx * 0.5
+        case .roam:
+            if Int.random(in: 0..<300) == 0 { roam[i] = span.minX + CGFloat.random(in: 0...1) * span.width }
+            return roam[i]
+        }
+    }
 
     /// The part of the strip you can actually see (the bar may clip a wide view).
     private var span: (minX: CGFloat, width: CGFloat) {
@@ -200,16 +248,29 @@ final class TouchBarCat: NSObject, NSTouchBarDelegate {
         }
         play.cat.speed = speed
         play.cat.sleepEnabled = naps
-        play.paused = paused
+        play.paused = paused || noCat
         world = Self.world(minX: minX, width: w, cursor: CGPoint(x: x, y: 13))
         play.keepInside(minX...(minX + w))     // nothing gets lost off the ends of the bar
         play.tick10(world: world)
+        for i in extras.indices {
+            extras[i].cat.speed = speed * (1 + 0.08 * CGFloat(i % 8 + 1))
+            extras[i].cat.sleepEnabled = naps
+            extras[i].paused = paused
+            let tx = min(max(target(of: i, main: x), minX + 16), minX + w - 16)
+            extras[i].keepInside(minX...(minX + w))
+            extras[i].tick10(world: Self.world(minX: minX, width: w, cursor: CGPoint(x: tx, y: 13)))
+        }
         afterChange()
     }
 
     func physics(dt: CGFloat) {
         guard isShowing else { return }
         play.physics(dt: dt, world: world)
+        for i in extras.indices where extras[i].needsPhysics {
+            var w = world
+            w.cursor = CGPoint(x: extras[i].cat.position.x, y: 13)
+            extras[i].physics(dt: dt, world: w)
+        }
         // Got well above the top of the bar on its way up (say, flung by a box): off it goes.
         if flickToDesktop, !leaving, Self.isEscaping(play) {
             leaving = true
@@ -238,6 +299,12 @@ final class TouchBarCat: NSObject, NSTouchBarDelegate {
             if e == .heart { view.popHeart() }
             onEvent?(e)
         }
+        for i in extras.indices {
+            for e in extras[i].drainEvents() {
+                if e == .heart { view.popHeart(extra: i) }
+                onEvent?(e)
+            }
+        }
         render()
     }
 
@@ -252,7 +319,8 @@ final class TouchBarCat: NSObject, NSTouchBarDelegate {
 
     private func render() {
         guard isShowing else { return }
-        view.render(play: play, sprites: sprites)
+        view.render(play: play, sprites: sprites, hideCat: noCat,
+                    extras: extras.enumerated().map { ($1, extraSheets[safe: $0] ?? sprites) })
     }
 
     // MARK: - Touch
@@ -265,6 +333,16 @@ final class TouchBarCat: NSObject, NSTouchBarDelegate {
             touchStart = p
             touchMoved = false
             longPressed = false
+            touchExtra = nil
+            if thing(at: p) == nil, let i = extras.lastIndex(where: { $0.catContains(p, slop: 6) }) {
+                touchExtra = i                           // one of the other cats
+                touchThing = .cat
+                extras[i].mouseDown(on: .cat, at: p, time: t)
+                let work = DispatchWorkItem { [weak self] in self?.longPressFired() }
+                longPress = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+                return
+            }
             guard let thing = thing(at: p) else {
                 touchThing = nil
                 tapTarget = (p.x, CACurrentMediaTime() + 4)
@@ -283,7 +361,7 @@ final class TouchBarCat: NSObject, NSTouchBarDelegate {
                 touchMoved = true
                 longPress?.cancel()
             }
-            play.mouseDragged(to: p, time: t)
+            if let i = touchExtra { extras[i].mouseDragged(to: p, time: t) } else { play.mouseDragged(to: p, time: t) }
             render()
             onNeedsPhysics?()
         case .ended, .cancelled:
@@ -295,6 +373,13 @@ final class TouchBarCat: NSObject, NSTouchBarDelegate {
             if !touchMoved {
                 if let l = lastTap, t - l.t < 0.35, abs(l.x - p.x) < 24 { clicks = 2 }
                 lastTap = (p.x, t)
+            }
+            if let i = touchExtra {                       // the other cats stay on the bar
+                extras[i].mouseUp(at: p, time: t, clickCount: clicks)
+                touchExtra = nil
+                afterChange()
+                onNeedsPhysics?()
+                return
             }
             play.mouseUp(at: p, time: t, clickCount: clicks)
             if flickToDesktop, touchThing == .cat, Self.goesToDesktop(play), !leaving {
@@ -319,13 +404,13 @@ final class TouchBarCat: NSObject, NSTouchBarDelegate {
     private func longPressFired() {
         guard let thing = touchThing, !touchMoved else { return }
         longPressed = true
-        play.rightClick(thing)                           // clip / unclip / box flaps
+        if let i = touchExtra { extras[i].rightClick(.cat) } else { play.rightClick(thing) }   // clip / unclip / box flaps
         afterChange()
         onNeedsPhysics?()
     }
 
     private func thing(at p: CGPoint) -> Thing? {
-        if play.catContains(p, slop: 6) {
+        if !noCat, play.catContains(p, slop: 6) {
             return play.inBox && play.boxClosed ? .box : .cat   // a shut-in cat comes with its box
         }
         if play.bone.isOut, abs(p.x - play.bone.body.pos.x) < 14, abs(p.y - play.bone.body.pos.y) < 22 { return .bone }
@@ -338,6 +423,7 @@ final class TouchBarCat: NSObject, NSTouchBarDelegate {
 final class TouchBarCatView: NSView {
     var onTouch: ((NSTouch.Phase, CGPoint, Double) -> Void)?
     private let cat = CatRig()
+    private var extraRigs: [CatRig] = []
     private let bone = PropRig(art: PixelArt.bone)
     private let box = PropRig(art: PixelArt.box)
 
@@ -359,12 +445,24 @@ final class TouchBarCatView: NSView {
 
     override var intrinsicContentSize: NSSize { NSSize(width: 1000, height: 30) }
 
-    func render(play: Playground, sprites: SpriteSheet) {
+    func render(play: Playground, sprites: SpriteSheet, hideCat: Bool = false, extras: [(Playground, SpriteSheet)] = []) {
         let pose = play.catPose
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        cat.layer.isHidden = hideCat
         cat.render(pose, image: sprites.image(for: pose.sprite, frame: pose.frame))
         cat.layer.position = CGPoint(x: pose.center.x.rounded(), y: pose.center.y.rounded())
+        while extraRigs.count > extras.count { extraRigs.removeLast().layer.removeFromSuperlayer() }
+        while extraRigs.count < extras.count {
+            let r = CatRig()
+            layer?.insertSublayer(r.layer, below: cat.layer)
+            extraRigs.append(r)
+        }
+        for (r, (p, sheet)) in zip(extraRigs, extras) {
+            let q = p.catPose
+            r.render(q, image: sheet.image(for: q.sprite, frame: q.frame))
+            r.layer.position = CGPoint(x: q.center.x.rounded(), y: q.center.y.rounded())
+        }
 
         bone.layer.isHidden = !play.bone.isOut
         if play.bone.isOut {
@@ -384,6 +482,7 @@ final class TouchBarCatView: NSView {
     }
 
     func popHeart() { cat.popHeart() }
+    func popHeart(extra i: Int) { extraRigs[safe: i]?.popHeart() }
 
     override func touchesBegan(with event: NSEvent) { send(.began, event) }
     override func touchesMoved(with event: NSEvent) { send(.moved, event) }

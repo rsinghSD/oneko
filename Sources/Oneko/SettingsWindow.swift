@@ -14,7 +14,7 @@ final class SettingsWindow: NSWindow {
                    styleMask: [.titled, .closable], backing: .buffered, defer: false)
         isReleasedWhenClosed = false
         tabs.tabStyle = .toolbar
-        pages = [GeneralPage(), NapsPage(), ToysPage(), SoundsPage()]
+        pages = [GeneralPage(), CatsPage(), NapsPage(), ToysPage(), SoundsPage()]
         if TouchBarCat.isSupported { pages.append(TouchBarPage()) }
         pages.append(StatsPage())
         for p in pages {
@@ -51,9 +51,6 @@ final class SettingsWindow: NSWindow {
     }
 }
 
-private extension Array {
-    subscript(safe i: Int) -> Element? { indices.contains(i) ? self[i] : nil }
-}
 
 // MARK: - Building blocks
 
@@ -145,7 +142,6 @@ final class GeneralPage: SettingsPage {
     override var symbol: String { "gearshape" }
     private lazy var speed = popup(Settings.Speed.allCases.map(\.title), #selector(speedChanged))
     private lazy var size = popup(Settings.Size.allCases.map(\.title), #selector(sizeChanged))
-    private lazy var cats = popup((1...5).map { $0 == 1 ? "1 cat" : "\($0) cats" }, #selector(catsChanged))
     private lazy var coat = popup([], #selector(coatChanged))
     private lazy var hat = popup(["Seasonal", "None", "Santa Hat", "Witch Hat", "Party Hat"], #selector(hatChanged))
     private lazy var paused = checkbox("Paused (curls up and sleeps)", #selector(pauseChanged))
@@ -162,7 +158,6 @@ final class GeneralPage: SettingsPage {
         coat.addItems(withTitles: Skin.all.map(\.title) + ["My Coat", "Custom Sprite Sheet…"])
         row("Speed", speed)
         row("Size", size)
-        row("Cats", cats)
         gap()
         row("Coat", coat, button("Paint Your Coat…", #selector(paintCoat)))
         row("Hat", hat)
@@ -176,8 +171,6 @@ final class GeneralPage: SettingsPage {
         speed.selectItem(at: Settings.Speed.allCases.firstIndex(of: s.speed) ?? 1)
         size.selectItem(at: Settings.Size.allCases.firstIndex(of: s.size) ?? 0)
         size.isEnabled = app?.touchBar == nil
-        cats.selectItem(at: s.catCount - 1)
-        cats.isEnabled = app?.touchBar == nil
         if let i = Skin.all.firstIndex(where: { $0.id == s.skin }) { coat.selectItem(at: i) }
         else if s.skin == Skin.paintedID { coat.selectItem(at: Skin.all.count) }
         else { coat.selectItem(at: Skin.all.count + 1) }
@@ -194,13 +187,6 @@ final class GeneralPage: SettingsPage {
     }
     @objc private func sizeChanged() {
         changed { app?.settings.size = Settings.Size.allCases[size.indexOfSelectedItem]; app?.applySettings() }
-    }
-    @objc private func catsChanged() {
-        changed {
-            let n = cats.indexOfSelectedItem + 1
-            app?.settings.catCount = n
-            app?.setCatCount(n)
-        }
     }
     @objc private func coatChanged() {
         let i = coat.indexOfSelectedItem
@@ -221,6 +207,205 @@ final class GeneralPage: SettingsPage {
     @objc private func loginChanged() { changed { app?.toggleLaunchAtLogin() } }
 }
 
+// MARK: - Cats
+
+final class CatsPage: SettingsPage {
+    override var symbol: String { "pawprint" }
+    private let formatter: NumberFormatter = {
+        let f = NumberFormatter()
+        f.numberStyle = .decimal
+        f.allowsFloats = false
+        f.minimum = 0
+        f.maximum = NSNumber(value: Settings.maxCrowdCats)
+        return f
+    }()
+    private lazy var count: NSTextField = {
+        let t = NSTextField()
+        t.formatter = formatter
+        t.alignment = .right
+        t.target = self
+        t.action = #selector(countChanged)
+        t.widthAnchor.constraint(equalToConstant: 90).isActive = true
+        return t
+    }()
+    private lazy var stepper: NSStepper = {
+        let s = NSStepper()
+        s.minValue = 0
+        s.increment = 1
+        s.valueWraps = false
+        s.target = self
+        s.action = #selector(stepped)
+        return s
+    }()
+    private lazy var crowd = checkbox("Crowd mode: cats past 50 are light GPU cats", #selector(crowdChanged))
+    private lazy var behavior = popup(Settings.CatBehavior.allCases.map(\.title), #selector(behaviorChanged))
+    private lazy var coats = popup(Settings.CoatMode.allCases.map(\.title), #selector(coatsChanged))
+    private lazy var choose = button("Choose…", #selector(chooseCoats))
+    private let warning = NSTextField(wrappingLabelWithString: "")
+    private var warningRow: NSGridRow?
+    private var coatList: CoatListPanel?
+
+    override init(nibName: NSNib.Name?, bundle: Bundle?) {
+        super.init(nibName: nil, bundle: nil)
+        title = "Cats"
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func build() {
+        row("Cats", count, stepper)
+        row("", crowd)
+        note("Optional. Off, every cat is a real cat you can pet, yeet and park, up to 10,000 (each one is a little window, so it costs CPU). On, cats past 50 are drawn by the graphics chip instead: light on resources, click-through, up to 1,000,000.")
+        warning.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium)
+        warning.textColor = .systemOrange
+        warning.preferredMaxLayoutWidth = 300
+        warningRow = grid.addRow(with: [NSGridCell.emptyContentView, warning])
+        gap()
+        row("Extra cats", behavior)
+        row("Coats", coats, choose)
+        if TouchBarCat.isSupported { note("The Touch Bar shows up to 50 cats.") }
+    }
+
+    override func refresh() {
+        guard let s = app?.settings else { return }
+        let n = s.catCount
+        let max = s.crowdMode ? Settings.maxCrowdCats : Settings.maxRealCats
+        formatter.maximum = NSNumber(value: max)
+        stepper.maxValue = Double(max)
+        if count.currentEditor() == nil { count.integerValue = n }
+        stepper.integerValue = n
+        crowd.state = s.crowdMode ? .on : .off
+        behavior.selectItem(at: Settings.CatBehavior.allCases.firstIndex(of: s.catBehavior) ?? 0)
+        coats.selectItem(at: Settings.CoatMode.allCases.firstIndex(of: s.coatMode) ?? 0)
+        choose.isEnabled = s.coatMode == .custom && n >= 2
+        let heavy = !s.crowdMode && n > 200, wild = s.crowdMode && n > 10_000
+        warning.stringValue = heavy
+            ? "\(n.formatted()) real cats, each with its own window and physics. Past a few hundred your Mac will feel it."
+            : wild ? "That's a lot of cats. Past about 10,000 they get choppy, and around a million the screen is solid cat." : ""
+        warningRow?.isHidden = !heavy && !wild
+    }
+
+    private func setCount(_ n: Int) {
+        guard let app else { return }
+        let real = app.settings.crowdMode ? min(n, Settings.crowdAfter) : min(n, Settings.maxRealCats)
+        if real > 1000, real > app.settings.realCatCount, !confirmRealCats(real) { refresh(); return }
+        changed {
+            app.settings.catCount = n
+            app.setCatCount(app.settings.catCount)
+        }
+    }
+
+    /// Thousands of real cats are heavy: ask once before spawning them.
+    private func confirmRealCats(_ n: Int) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "Spawn \(n.formatted()) real cats?"
+        alert.informativeText = "Each real cat is its own little window with its own physics. A thousand is fine on most Macs; thousands more will make it feel slow. Crowd mode keeps big numbers light."
+        alert.addButton(withTitle: "Spawn Them")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    @objc private func countChanged() { setCount(count.integerValue) }
+    @objc private func stepped() { setCount(stepper.integerValue) }
+    @objc private func crowdChanged() {
+        changed {
+            guard let app else { return }
+            let on = crowd.state == .on
+            // Turning it off makes every cat real (up to 10,000): ask first if that's a lot.
+            let real = min(app.settings.catCount, Settings.maxRealCats)
+            if !on, real > 1000, !confirmRealCats(real) { return }
+            app.settings.crowdMode = on
+            app.setCatCount(app.settings.catCount)
+        }
+    }
+    @objc private func behaviorChanged() {
+        changed {
+            app?.settings.catBehavior = Settings.CatBehavior.allCases[behavior.indexOfSelectedItem]
+            app?.catsChanged()
+        }
+    }
+    @objc private func coatsChanged() {
+        changed {
+            app?.settings.coatMode = Settings.CoatMode.allCases[coats.indexOfSelectedItem]
+            app?.reloadSprites()
+        }
+    }
+    @objc private func chooseCoats() {
+        guard let app, let w = view.window else { return }
+        let panel = CoatListPanel(app: app)
+        coatList = panel
+        w.beginSheet(panel)
+    }
+}
+
+/// One coat per cat, for cats 2…50.
+final class CoatListPanel: NSPanel {
+    private weak var app: AppDelegate?
+    private static var choices: [(id: String, title: String)] {
+        [("", "Take turns")] + Skin.all.map { ($0.id, $0.title) } + [(Skin.paintedID, "My Coat"), ("random", "Random")]
+    }
+
+    init(app: AppDelegate) {
+        self.app = app
+        super.init(contentRect: NSRect(x: 0, y: 0, width: 320, height: 420), styleMask: [.titled], backing: .buffered, defer: false)
+        let n = min(app.settings.realCatCount, 50)
+        let saved = app.settings.customCoats
+        let rows = NSStackView()
+        rows.orientation = .vertical
+        rows.alignment = .leading
+        rows.spacing = 6
+        for i in 0..<max(0, n - 1) {
+            let p = NSPopUpButton()
+            p.addItems(withTitles: Self.choices.map(\.title))
+            p.selectItem(at: Self.choices.firstIndex { $0.id == (saved[safe: i] ?? "") } ?? 0)
+            p.tag = i
+            p.target = self
+            p.action = #selector(picked(_:))
+            let label = NSTextField(labelWithString: "Cat \(i + 2):")
+            label.alignment = .right
+            label.widthAnchor.constraint(equalToConstant: 60).isActive = true
+            let row = NSStackView(views: [label, p])
+            row.spacing = 8
+            rows.addArrangedSubview(row)
+        }
+        rows.edgeInsets = NSEdgeInsets(top: 12, left: 16, bottom: 12, right: 16)
+        let doc = FlippedView()
+        rows.translatesAutoresizingMaskIntoConstraints = false
+        doc.addSubview(rows)
+        let fit = rows.fittingSize
+        doc.frame = NSRect(x: 0, y: 0, width: max(300, fit.width), height: fit.height)
+        rows.frame = doc.bounds
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 44, width: 320, height: 376))
+        scroll.hasVerticalScroller = true
+        scroll.documentView = doc
+        scroll.drawsBackground = false
+        let done = NSButton(title: "Done", target: self, action: #selector(finish))
+        done.bezelStyle = .rounded
+        done.keyEquivalent = "\r"
+        done.frame = NSRect(x: 320 - 96, y: 10, width: 80, height: 28)
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 420))
+        content.addSubview(scroll)
+        content.addSubview(done)
+        contentView = content
+    }
+
+    @objc private func picked(_ sender: NSPopUpButton) {
+        guard let app else { return }
+        var list = app.settings.customCoats
+        while list.count <= sender.tag { list.append("") }
+        list[sender.tag] = Self.choices[sender.indexOfSelectedItem].id
+        app.settings.customCoats = list
+        app.reloadSprites()
+    }
+
+    @objc private func finish() {
+        sheetParent?.endSheet(self)
+    }
+}
+
+private final class FlippedView: NSView {
+    override var isFlipped: Bool { true }
+}
+
 // MARK: - Naps & behaviour
 
 final class NapsPage: SettingsPage {
@@ -232,6 +417,8 @@ final class NapsPage: SettingsPage {
     private lazy var reacts = checkbox("Reacts to your Mac", #selector(reactsChanged))
     private lazy var fullScreen = checkbox("Hide in full-screen apps", #selector(fullScreenChanged))
     private lazy var reduceMotion = checkbox("Keep chasing when Reduce Motion is on", #selector(reduceMotionChanged))
+    private let dockStatus = NSTextField(labelWithString: "")
+    private lazy var dockButton = button("Allow Exact Size…", #selector(dockExact))
 
     override init(nibName: NSNib.Name?, bundle: Bundle?) {
         super.init(nibName: nil, bundle: nil)
@@ -249,6 +436,9 @@ final class NapsPage: SettingsPage {
         note("Naps when you've been away for 2 minutes and stretches awake when you're back; a little sleepier late at night.")
         row("", fullScreen)
         row("", reduceMotion)
+        gap()
+        row("Dock size", dockStatus, dockButton)
+        note("Oneko works out how long the Dock is from its icons. With Accessibility access it reads the Dock's exact size instead (it never reads anything else).")
     }
 
     override func refresh() {
@@ -262,7 +452,12 @@ final class NapsPage: SettingsPage {
         fullScreen.state = s.hideInFullScreen ? .on : .off
         fullScreen.isEnabled = app?.touchBar == nil
         reduceMotion.state = s.ignoreReduceMotion ? .on : .off
+        let exact = WorldReader.exactDockAllowed
+        dockStatus.stringValue = exact ? "Exact (Accessibility allowed)" : "Estimated from its icons"
+        dockButton.isHidden = exact
     }
+
+    @objc private func dockExact() { WorldReader.askForExactDock() }
 
     @objc private func napsChanged() { changed { app?.toggleNaps() } }
     @objc private func windowsChanged() { changed { app?.toggleSpotWindows() } }

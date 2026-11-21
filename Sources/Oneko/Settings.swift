@@ -85,11 +85,66 @@ final class Settings {
         get { defaults.float(forKey: Key.volume) }
         set { defaults.set(newValue, forKey: Key.volume) }
     }
-    /// How many cats (1…5).
+    /// In crowd mode, every cat past this many is a crowd cat.
+    static let crowdAfter = 50
+    /// Real cats (each its own window and physics) stop here, so a saved count can never
+    /// make Oneko too heavy to even launch.
+    static let maxRealCats = 10_000
+    /// Crowd mode goes up to this many in all.
+    static let maxCrowdCats = 1_000_000
+
+    /// How many cats: up to 10,000 real cats, or up to 1,000,000 in crowd mode.
     var catCount: Int {
-        get { max(1, min(5, defaults.integer(forKey: Key.catCount))) }
-        set { defaults.set(max(1, min(5, newValue)), forKey: Key.catCount) }
+        get { max(0, min(crowdMode ? Self.maxCrowdCats : Self.maxRealCats, defaults.integer(forKey: Key.catCount))) }
+        set { defaults.set(max(0, min(crowdMode ? Self.maxCrowdCats : Self.maxRealCats, newValue)), forKey: Key.catCount) }
     }
+    /// Optional, the nuts.wad switch: cats past 50 are crowd cats (GPU-drawn, click-through,
+    /// light on resources). Off, every cat is a real cat.
+    var crowdMode: Bool { get { bool(Key.crowdMode) } set { set(newValue, Key.crowdMode) } }
+    /// Cats you can pet, yeet and park.
+    var realCatCount: Int { crowdMode ? min(catCount, Self.crowdAfter) : catCount }
+    /// Cats drawn by the graphics chip.
+    var crowdCatCount: Int { crowdMode ? max(0, catCount - Self.crowdAfter) : 0 }
+
+    enum CatBehavior: String, CaseIterable {
+        case swarm, conga, roam
+        var title: String {
+            switch self {
+            case .swarm: return "Swarm (each chases your cursor)"
+            case .conga: return "Conga line (follow the one in front)"
+            case .roam: return "Free roam (wander and nap)"
+            }
+        }
+    }
+    /// What the extra cats do.
+    var catBehavior: CatBehavior {
+        get { CatBehavior(rawValue: defaults.string(forKey: Key.catBehavior) ?? "") ?? .swarm }
+        set { defaults.set(newValue.rawValue, forKey: Key.catBehavior) }
+    }
+
+    enum CoatMode: String, CaseIterable {
+        case rotate, same, random, custom
+        var title: String {
+            switch self {
+            case .rotate: return "Take turns with the other coats"
+            case .same: return "Same coat as the first cat"
+            case .random: return "A random coat each"
+            case .custom: return "Choose for each cat"
+            }
+        }
+    }
+    /// What the extra cats wear.
+    var coatMode: CoatMode {
+        get { CoatMode(rawValue: defaults.string(forKey: Key.coatMode) ?? "") ?? .rotate }
+        set { defaults.set(newValue.rawValue, forKey: Key.coatMode) }
+    }
+    /// Custom coats for cats 2, 3, … (skin ids; "" = take turns).
+    var customCoats: [String] {
+        get { defaults.stringArray(forKey: Key.customCoats) ?? [] }
+        set { defaults.set(newValue, forKey: Key.customCoats) }
+    }
+    /// The How to Play window has been shown once.
+    var seenWelcome: Bool { get { bool(Key.seenWelcome) } set { set(newValue, Key.seenWelcome) } }
     /// "auto" (seasonal), "none", "santa", "witch", "party".
     var hat: String {
         get { defaults.string(forKey: Key.hat) ?? "auto" }
@@ -178,5 +233,7 @@ final class Settings {
         static let yarnOut = "yarnOut", slamToTouchBar = "slamToTouchBar", flickToDesktop = "flickToDesktop"
         static let paintOutline = "paintOutline", paintFill = "paintFill", paintAccent = "paintAccent"
         static let paintPattern = "paintPattern"
+        static let crowdMode = "crowdMode", catBehavior = "catBehavior", coatMode = "coatMode"
+        static let customCoats = "customCoats", seenWelcome = "seenWelcome"
     }
 }

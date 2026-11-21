@@ -42,6 +42,27 @@ struct Skin {
         Skin(id: "sakura", title: "Sakura", outline: RGBA(r: 122, g: 46, b: 74), fill: RGBA(r: 255, g: 198, b: 217)),
         Skin(id: "ghost", title: "Ghost", outline: RGBA(r: 120, g: 160, b: 220, a: 230), fill: RGBA(r: 255, g: 255, b: 255, a: 110)),
     ]
+
+    /// A made-up coat, always the same one for the same seed: any colour, any pattern.
+    static func random(seed: Int) -> Skin {
+        var h = UInt64(truncatingIfNeeded: seed &+ 1) &* 0x9E37_79B9_7F4A_7C15
+        func next() -> Double {
+            h ^= h >> 31; h = h &* 0xBF58_476D_1CE4_E5B9; h ^= h >> 29
+            return Double(h % 10_000) / 10_000
+        }
+        func color(_ hue: Double, _ sat: Double, _ bri: Double) -> RGBA {
+            let i = Int(hue * 6) % 6, f = hue * 6 - Double(Int(hue * 6))
+            let p = bri * (1 - sat), q = bri * (1 - f * sat), t = bri * (1 - (1 - f) * sat)
+            let (r, g, b) = [(bri, t, p), (q, bri, p), (p, bri, t), (p, q, bri), (t, p, bri), (bri, p, q)][i]
+            return RGBA(r: UInt8(r * 255), g: UInt8(g * 255), b: UInt8(b * 255))
+        }
+        let hue = next()
+        let fill = color(hue, 0.25 + next() * 0.6, 0.55 + next() * 0.45)
+        let accent = color((hue + 0.08 + next() * 0.3).truncatingRemainder(dividingBy: 1), 0.3 + next() * 0.6, 0.3 + next() * 0.6)
+        let outline = color(hue, 0.5, 0.12 + next() * 0.2)
+        let pattern = CoatPattern.allCases[Int(next() * Double(CoatPattern.allCases.count)) % CoatPattern.allCases.count]
+        return Skin(id: "random-\(seed)", title: "Random", outline: outline, fill: fill, accent: accent, pattern: pattern)
+    }
 }
 
 /// The 256×128 oneko sheet: 8×4 frames of 32×32.
@@ -109,6 +130,9 @@ final class SpriteSheet {
         let img = PixelArt.makeImage(out, width: width, height: pixels.count / 4 / width) ?? sheet
         return SpriteSheet(sheet: img, pixels: out, width: width)
     }
+
+    /// The whole sheet as premultiplied RGBA8, top row first (for the crowd's GPU texture).
+    var rgbaPixels: [UInt8] { pixels }
 
     func image(col: Int, row: Int) -> CGImage? {
         let key = row * 8 + col

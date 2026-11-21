@@ -16,8 +16,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private(set) var laserOn = false
     let sounds = SoundBox()
     let stats = Stats()
-    /// Extra cats (beyond the first), each following the one in front.
+    /// Extra cats (beyond the first, up to 50 in all), fully interactive.
     private var extras: [ExtraCat] = []
+    /// Crowd mode: every cat past 50, drawn by the GPU.
+    private var crowd: CrowdController?
+    private let hintWindow = HintWindow()
+    private var hoverSince: Double?
     private var draggingExtra: Int?
     private var coatPainter: CoatPainter?
     /// You've stepped away from the Mac (no input for 2 minutes).
@@ -55,6 +59,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         laserWindow.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 1)
         sounds.enabled = settings.sound
         sounds.volume = settings.volume
+        confirmSavedCats()
         setCatCount(settings.catCount)
         applySettings()
         setUpStatusItem()
@@ -67,6 +72,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if settings.touchBarCat && TouchBarCat.isSupported { setHome(touchBar: true) }
 
         setLogicRate(deepSleep ? 1.0 : 0.1)
+        if !settings.seenWelcome {
+            settings.seenWelcome = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in self?.showWelcome() }
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -162,7 +171,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         play.physics(dt: 1.0 / 60, world: world)
         for (i, e) in extras.enumerated() {
             var w = world
-            w.cursor = leader(of: i)
+            w.cursor = target(of: i)
             e.play.physics(dt: 1.0 / 60, world: w)
         }
         handleEvents()
@@ -239,7 +248,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let wantBox = play.box.isOut && !pose.inBox && !hiddenAt(play.box.body.pos)
         let wantBone = play.bone.isOut && !hiddenAt(play.bone.body.pos)
         let wantYarn = play.yarn.isOut && !hiddenAt(play.yarn.body.pos)
-        let wantCat = !hiddenAt(pose.center) || dragging == .cat
+        let wantCat = !noCat && (!hiddenAt(pose.center) || dragging == .cat)
         var order: [(NSWindow, Bool)] = [(boxWindow, wantBox), (boneWindow, wantBone), (yarnWindow, wantYarn)]
         for (i, x) in extras.enumerated() { order.append((x.window, !hiddenAt(x.play.cat.position) || draggingExtra == i)) }
         order.append((catWindow, wantCat))
@@ -314,11 +323,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Only the painted pixels of the cat and its toys catch clicks; everything else falls
     /// through to the app underneath.
     private func updateClickThrough() {
-        guard dragging == nil, draggingExtra == nil, !deepSleep else { return }
+        guard dragging == nil, draggingExtra == nil, !deepSleep else { hideHint(); return }
         if laserOn { laserWindow.place(NSEvent.mouseLocation) }
         let all: [NSWindow] = [catWindow, boneWindow, boxWindow, yarnWindow] + extras.map(\.window)
         if let t = toolbox, t.tool != .pointer {   // a Paint tool is active: the canvas gets every click
             for w in all where !w.ignoresMouseEvents { w.ignoresMouseEvents = true }
+            hideHint()
             return
         }
         let p = NSEvent.mouseLocation
@@ -332,10 +342,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let ignore = hitExtra != i
             if x.window.ignoresMouseEvents != ignore { x.window.ignoresMouseEvents = ignore }
         }
+        // Hovering over a sleeping cat: tell people how to wake it.
+        var sleeper: (CGPoint, CGFloat)?
+        if hit == .cat, play.isSleeping { sleeper = (play.catPose.center, play.catScale) }
+        if let i = hitExtra, extras[i].play.isSleeping { sleeper = (extras[i].play.catPose.center, extras[i].play.catScale) }
+        if let (c, s) = sleeper {
+            let now = CACurrentMediaTime()
+            if hoverSince == nil { hoverSince = now }
+            if now - hoverSince! > 0.4 { hintWindow.show(above: CGPoint(x: c.x, y: c.y + 14 * s)) }
+        } else {
+            hideHint()
+        }
+    }
+
+    private func hideHint() {
+        hoverSince = nil
+        if hintWindow.isVisible { hintWindow.orderOut(nil) }
     }
 
     private func catHit(_ p: CGPoint, _ pose: CatPose, _ sheet: SpriteSheet, _ s: CGFloat, _ w: NSWindow) -> Bool {
-        guard w.isVisible else { return false }
+        guard abs(p.x - pose.center.x) < 17 * s, abs(p.y - pose.center.y) < 17 * s, w.isVisible else { return false }
         let x = Int(((p.x - pose.center.x) / s + 16).rounded(.down))
         let y = Int(((pose.center.y - p.y) / s + 16).rounded(.down))
         return sheet.isOpaque(pose.sprite, frame: pose.frame, x: x, y: y)
@@ -343,7 +369,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func thing(at p: CGPoint) -> Thing? {
-        if catHit(p, play.catPose, sprites, play.catScale, catWindow) { return .cat }
+        if !noCat, catHit(p, play.catPose, sprites, play.catScale, catWindow) { return .cat }
         if yarnWindow.isVisible, yarnWindow.hit(p, center: play.yarn.body.pos, slop: 2) { return .yarn }
         if boneWindow.isVisible, boneWindow.hit(p, center: play.bone.body.pos, slop: 2) { return .bone }
         if boxWindow.isVisible, boxWindow.hit(p, center: play.box.body.pos) { return .box }
@@ -384,16 +410,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                            screens: NSScreen.screens.map(\.frame))
 
         let wasPaused = play.paused
-        play.paused = settings.paused || deepSleep || away || (reduceMotion && !settings.ignoreReduceMotion)
+        let allPaused = settings.paused || deepSleep || away || (reduceMotion && !settings.ignoreReduceMotion)
+        play.paused = allPaused || noCat
         if wasPaused && !play.paused { play.cat.wakeUp() }
         for (i, x) in extras.enumerated() {
-            x.play.cat.speed = play.cat.speed * (1 + 0.08 * CGFloat(i + 1))   // a little personality
+            x.play.cat.speed = play.cat.speed * (1 + 0.08 * CGFloat(i % 8 + 1))   // a little personality
             x.play.cat.sleepEnabled = settings.naps
-            x.play.paused = play.paused
+            x.play.paused = allPaused
             x.play.gravityMode = play.gravityMode
             x.play.sleepy = play.sleepy
         }
-        statusItem?.button?.appearsDisabled = play.paused
+        crowd?.paused = allPaused
+        crowd?.speed = play.cat.speed
+        crowd?.scale = CGFloat(scale)
+        crowd?.hideInFullScreen = settings.hideInFullScreen
+        statusItem?.button?.appearsDisabled = allPaused
         render()
     }
 
@@ -445,10 +476,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if toolbox != nil { toggleToolbox() }      // the toolbox is a desktop thing
             savePositions()
             removeMouseMonitors()
-            for w in [catWindow as NSWindow, boneWindow, boxWindow, yarnWindow, laserWindow] + extras.map(\.window) {
+            for w in [catWindow as NSWindow, boneWindow, boxWindow, yarnWindow, laserWindow, hintWindow] + extras.map(\.window) {
                 w.orderOut(nil)
             }
+            crowd?.setVisible(false)
             let tb = touchBar ?? TouchBarCat(sprites: sprites, icon: classic.menuBarIcon())
+            tb.setCats(min(settings.catCount, TouchBarCat.maxCats), sheets: (0..<TouchBarCat.maxCats).map(extraSheet),
+                       behavior: settings.catBehavior)
             tb.onNeedsPhysics = { [weak self] in self?.startPhysicsIfNeeded() }
             tb.onYeetToDesktop = { [weak self] along, v in self?.yeetFromTouchBar(along: along, velocity: v) }
             tb.onEvent = { [weak self] e in self?.react(to: e, window: nil, primary: false) }
@@ -469,7 +503,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if settings.boneOut && play.bone.state == .hidden { play.placeBone(at: dropPoint(offset: -80), falling: true) }
             if !settings.boneOut && play.bone.state != .hidden { play.removeBone() }
             if !deepSleep { installMouseMonitors() }
-            catWindow.orderFrontRegardless()
+            if !noCat { catWindow.orderFrontRegardless() }
+            crowd?.setVisible(true)
             render()
             startPhysicsIfNeeded()
         }
@@ -549,6 +584,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
 
         menu.addItem(item("Settings…", #selector(showSettings), key: ","))
+        menu.addItem(item("How to Play…", #selector(showWelcome)))
         menu.addItem(item("About Oneko", #selector(showAbout)))
         menu.addItem(NSMenuItem(title: "Quit Oneko", action: #selector(NSApplication.terminate(_:)),
                                 keyEquivalent: "q"))
@@ -612,7 +648,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             sprites = classic.recolored(Skin(id: "paint", title: "Paint", outline: RGBA(r: 0, g: 0, b: 0), fill: c))
         }
         touchBar?.sprites = sprites
-        for (i, x) in extras.enumerated() { x.sprites = classic.recolored(extraSkin(i)) }
+        touchBar?.setSheets((0..<TouchBarCat.maxCats).map(extraSheet))
+        for (i, x) in extras.enumerated() { x.sprites = extraSheet(i) }
+        crowd?.setCoats(crowdSheets())
         render()
     }
 
@@ -695,6 +733,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private var aboutWindow: AboutWindow?
+    private var welcomeWindow: WelcomeWindow?
+
+    @objc func showWelcome() {
+        let w = welcomeWindow ?? WelcomeWindow(icon: classic.image(for: .idle, frame: 0))
+        welcomeWindow = w
+        w.present()
+    }
 
     @objc func showAbout() {
         let w = aboutWindow ?? AboutWindow(icon: classic.image(for: .idle, frame: 0))
@@ -738,19 +783,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - More cats
 
-    /// 1…5 cats. The first is the one with toys; the rest follow in a little line.
+    /// No cats at all (count 0): just the toys.
+    private var noCat: Bool { settings.catCount == 0 }
+
+    /// Real cats (the first one has the toys), and in crowd mode the rest as a GPU-drawn
+    /// crowd. Real cats arrive in batches of 100 a tick, so even thousands never freeze
+    /// the Mac while they spawn.
     func setCatCount(_ n: Int) {
-        let want = max(0, n - 1)
-        while extras.count > want {
+        wantExtras = max(0, settings.realCatCount - 1)
+        while extras.count > wantExtras {
             let x = extras.removeLast()
             x.window.orderOut(nil)
         }
-        while extras.count < want {
+        growExtras()
+        let crowdCount = settings.crowdCatCount
+        if crowdCount > 0 {
+            let c = crowd ?? CrowdController()
+            crowd = c
+            c.setCoats(crowdSheets())
+            c.setCount(crowdCount, around: play.cat.position)
+            c.setVisible(touchBar == nil)
+        } else if let c = crowd {
+            c.stop()
+            crowd = nil
+        }
+        touchBar?.setCats(min(n, TouchBarCat.maxCats), sheets: (0..<TouchBarCat.maxCats).map(extraSheet),
+                          behavior: settings.catBehavior)
+        applySettings()
+        updateVisibility(play.catPose)
+    }
+
+    /// Launching with thousands of real cats saved: ask before spawning them all.
+    private func confirmSavedCats() {
+        let n = settings.realCatCount
+        guard n > 1000 else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Spawn \(n.formatted()) real cats?"
+        alert.informativeText = "Oneko was left with \(n.formatted()) real cats. Each one is its own little window with its own physics, which keeps your Mac busy. Crowd mode draws every cat past 50 on the graphics chip instead, which is much lighter."
+        alert.addButton(withTitle: "Use Crowd Mode")
+        alert.addButton(withTitle: "Spawn Them")
+        alert.addButton(withTitle: "Just 1 Cat")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn: settings.crowdMode = true
+        case .alertThirdButtonReturn: settings.catCount = 1
+        default: break
+        }
+    }
+
+    /// How many extra real cats there should be (they may still be spawning).
+    private var wantExtras = 0
+
+    private func growExtras() {
+        guard extras.count < wantExtras else { return }
+        let scale = CGFloat(settings.size.rawValue)
+        let until = min(wantExtras, extras.count + 100)
+        while extras.count < until {
             let i = extras.count
-            var p = Playground(position: CGPoint(x: play.cat.position.x - CGFloat(40 * (i + 1)), y: play.cat.position.y))
+            let o = Self.swarmOffset(i, scale: scale)
+            let start = play.cat.clamp(CGPoint(x: play.cat.position.x + o.dx * swarmSquash, y: play.cat.position.y + o.dy * swarmSquash),
+                                       cursor: play.cat.position, screens: world.screenFrames)
+            var p = Playground(position: start)
             p.spotWindows = false; p.spotMenuBar = false; p.spotDock = false
             p.setScale(settings.size.rawValue)
-            let x = ExtraCat(play: p, sprites: classic.recolored(extraSkin(i)))
+            let x = ExtraCat(play: p, sprites: extraSheet(i))
             x.window.setScale(settings.size.rawValue)
             x.window.rig.setHat(currentHat())
             wire(extra: x, index: i)
@@ -759,23 +855,107 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         applySettings()
     }
 
-    /// Extra cats wear the other coats in turn.
-    private func extraSkin(_ i: Int) -> Skin {
+    /// Behaviour changed: everyone starts over with the new rule.
+    func catsChanged() {
+        for x in extras { x.roam = nil }
+        touchBar?.setCats(min(settings.catCount, TouchBarCat.maxCats), sheets: (0..<TouchBarCat.maxCats).map(extraSheet),
+                          behavior: settings.catBehavior)
+    }
+
+    /// Where swarm cat `i` sits around your cursor: a sunflower, so nobody overlaps.
+    static func swarmOffset(_ i: Int, scale: CGFloat) -> CGVector {
+        let r = 30 * scale * CGFloat(Double(i + 1).squareRoot())
+        let a = CGFloat(i + 1) * 2.399963
+        return CGVector(dx: r * cos(a), dy: r * sin(a))
+    }
+
+    /// The coat extra cat `i` wears (cat 2 is `i` = 0). Sheets are shared between cats
+    /// wearing the same coat, so thousands of cats don't mean thousands of sheets.
+    func extraSheet(_ i: Int) -> SpriteSheet {
+        switch settings.coatMode {
+        case .same: return sprites
+        case .rotate: return sheet(rotatingSkin(i))
+        case .random: return sheet(Skin.random(seed: i % 64))
+        case .custom:
+            let id = settings.customCoats[safe: i] ?? ""
+            if id == Skin.paintedID { return sheet(settings.paintedSkin) }
+            if id == "random" { return sheet(Skin.random(seed: i % 64)) }
+            if let skin = Skin.all.first(where: { $0.id == id }) { return sheet(skin) }
+            return sheet(rotatingSkin(i))
+        }
+    }
+
+    private var sheetCache: [String: SpriteSheet] = [:]
+
+    private func sheet(_ skin: Skin) -> SpriteSheet {
+        let key = skin.id == Skin.paintedID ? "painted-\(skin.fill.hex)\(skin.outline.hex)\((skin.accent ?? skin.fill).hex)\(skin.pattern.rawValue)" : skin.id
+        if let s = sheetCache[key] { return s }
+        let s = classic.recolored(skin)
+        sheetCache[key] = s
+        return s
+    }
+
+    /// Taking turns with the other coats.
+    private func rotatingSkin(_ i: Int) -> Skin {
         let others = Skin.all.filter { $0.id != settings.skin && $0.id != "ghost" }
         return others[i % others.count]
     }
 
-    /// Whom extra cat `i` follows: the first cat, or the extra cat in front of it.
-    private func leader(of i: Int) -> CGPoint {
-        i == 0 ? play.cat.position : extras[i - 1].play.cat.position
+    /// The coats the crowd wears, as whole sheets.
+    private func crowdSheets() -> [SpriteSheet] {
+        switch settings.coatMode {
+        case .same: return [sprites]
+        case .random: return (0..<24).map { classic.recolored(Skin.random(seed: 1000 + $0)) }
+        case .rotate, .custom:
+            return Skin.all.filter { $0.id != settings.skin && $0.id != "ghost" }.map { classic.recolored($0) }
+        }
+    }
+
+    /// What extra cat `i` runs after.
+    private func target(of i: Int) -> CGPoint {
+        switch settings.catBehavior {
+        case .conga:
+            return i == 0 ? play.cat.position : extras[i - 1].play.cat.position
+        case .swarm:
+            let o = Self.swarmOffset(i, scale: play.scale)
+            return CGPoint(x: world.cursor.x + o.dx * swarmSquash, y: world.cursor.y + o.dy * swarmSquash)
+        case .roam:
+            return extras[i].roam ?? extras[i].play.cat.position
+        }
+    }
+
+    /// Free roam: every now and then each cat picks somewhere new to wander to.
+    private func updateRoaming() {
+        guard settings.catBehavior == .roam, !world.screens.isEmpty else { return }
+        for x in extras {
+            let there = x.roam.map { hypot($0.x - x.play.cat.position.x, $0.y - x.play.cat.position.y) < x.play.cat.stopDistance + 4 } ?? true
+            if x.roam == nil || (there && Int.random(in: 0..<120) == 0) || Int.random(in: 0..<900) == 0 {
+                let s = world.screens[Int.random(in: 0..<world.screens.count)].visible.insetBy(dx: 40, dy: 40)
+                guard s.width > 0, s.height > 0 else { continue }
+                x.roam = CGPoint(x: CGFloat.random(in: s.minX...s.maxX), y: CGFloat.random(in: s.minY...s.maxY))
+            }
+        }
+    }
+
+    /// A big swarm is squeezed so it never gets much wider than all your displays together.
+    private var swarmSquash: CGFloat {
+        let natural = 30 * play.scale * CGFloat(Double(wantExtras + 1).squareRoot())
+        let area = world.screens.reduce(0) { $0 + $1.frame.width * $1.frame.height }
+        return area > 0 ? min(1, (area / .pi).squareRoot() * 1.15 / natural) : 1
     }
 
     private func tickExtras() {
+        growExtras()
+        updateRoaming()
         for (i, x) in extras.enumerated() {
             var w = world
-            w.cursor = leader(of: i)
+            w.cursor = target(of: i)
             x.play.tick10(world: w)
         }
+        crowd?.behavior = settings.catBehavior
+        crowd?.leader = extras.last?.play.cat.position ?? play.cat.position
+        crowd?.tick(cursor: world.cursor, screens: world.screens,
+                    covered: settings.hideInFullScreen ? world.fullScreenDisplays : [])
     }
 
     private func wire(extra x: ExtraCat, index i: Int) {
@@ -1021,9 +1201,15 @@ final class ExtraCat {
     var play: Playground
     let window = CatWindow()
     var sprites: SpriteSheet
+    /// Free roam: where it's wandering to.
+    var roam: CGPoint?
 
     init(play: Playground, sprites: SpriteSheet) {
         self.play = play
         self.sprites = sprites
     }
+}
+
+extension Array {
+    subscript(safe i: Int) -> Element? { indices.contains(i) ? self[i] : nil }
 }

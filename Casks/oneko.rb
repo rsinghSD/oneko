@@ -1,6 +1,6 @@
 cask "oneko" do
-  version "0.5.0"
-  sha256 "ef69db390caf7df5978f8b697deb61a8b16d46809fc2b1ff0a9427951a16082b"
+  version "0.5.5"
+  sha256 "de10cbc5cadc8b3fd4805652b29448183bfbaaf4e9d77f8b213d6b344fb26ca4"
 
   url "https://github.com/rsinghSD/oneko/releases/download/v#{version}/Oneko-#{version}.dmg"
   name "Oneko"

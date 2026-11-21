@@ -541,7 +541,7 @@ struct Playground {
                 // The first hard contact is the one that matters (it bounces before it rests).
                 let s = world.screen(containing: cat.position) ?? world.nearestScreen(to: cat.position)
                 let feet = cat.position.y - catShape.halfH + catShape.foot
-                let onFloor = s.map { abs(feet - $0.floor) < 2 } ?? false
+                let onFloor = s.map { abs(feet - $0.floor(at: cat.position.x)) < 2 } ?? false
                 events.append(.landed(impact: impact, onWindow: onFloor ? nil : 0, at: cat.position))
             case .rested(let win, let impact):
                 events.append(.landed(impact: impact, onWindow: win, at: cat.position))
@@ -717,6 +717,15 @@ struct Playground {
 
     var isDragging: Bool { grab?.dragging ?? false }
 
+    /// Asleep until you wake it: told to stay, parked, or off napping somewhere.
+    var isSleeping: Bool {
+        switch mode {
+        case .staying: return true
+        case .napping: return !(inBox && boxClosed)
+        default: return false
+        }
+    }
+
     /// Right-click. Mid-drag: clip whatever you're dragging right there. On a clipped thing:
     /// let go (it falls). On the cat: clip it where it is (even mid-flight). On the box (or
     /// the cat in it): open/close the flaps.
@@ -815,10 +824,13 @@ struct Playground {
     private mutating func click(_ thing: Thing, count: Int = 1) {
         switch thing {
         case .cat where count >= 2:
-            // Double-click: "stay!" — sleep right here. Double-click again to wake.
+            // Double-click: "stay!" — sleep right here. Double-click a sleeping cat to wake it
+            // (one that stays, or one off napping somewhere).
             if case .staying = mode {
                 mode = .chasing
                 cat.wakeUp()
+            } else if case .napping(let spot, _) = mode {
+                mode = .napping(spot, ticksLeft: 0)   // wakes on the next tick
             } else {
                 if mode == .returningBone { dropBone(falling: true) }
                 angry = false
@@ -905,7 +917,7 @@ struct Playground {
     private func landedOnDock(_ world: World) -> Bool {
         let feet = cat.position.y - catShape.halfH + catShape.foot
         return world.screens.contains { s in
-            guard let d = s.dock, d.width >= d.height, s.frame.minX <= cat.position.x, cat.position.x <= s.frame.maxX
+            guard let d = s.dock, d.width >= d.height, d.minX <= cat.position.x, cat.position.x <= d.maxX
             else { return false }
             return abs(feet - d.maxY) < 2
         }
@@ -995,7 +1007,8 @@ struct Playground {
         for s in world.screens {
             guard let d = s.dock else { continue }   // hidden Docks don't count
             if d.minY <= s.frame.minY + 1 && d.width >= d.height {       // bottom Dock: nap on top of it
-                let x = s.frame.midX + CGFloat(random(240) - 120) * scale
+                let room = max(0, min(120 * scale, d.width / 2 - catShape.halfW))
+                let x = d.midX + (room > 0 ? CGFloat(random(Int(2 * room) + 1)) - room : 0)
                 return NapSpot(kind: .dock, point: CGPoint(x: x, y: d.maxY + catShape.halfH - catShape.foot))
             }
             if d.minX <= s.frame.minX + 1 {                               // left Dock: curl up beside it
@@ -1302,23 +1315,27 @@ struct Playground {
         defer { lastDocks = docks }
         if dockCooldown > 0 { dockCooldown -= 1 }
 
-        // A Dock went away (auto-hide, or it moved to another display): whatever was
-        // sitting on top of it falls down to the real bottom of the screen.
+        // A Dock went away (auto-hide, or it moved to another display), or got shorter (an
+        // app quit): whatever was sitting on a part that's gone falls to the bottom.
         for d in lastDocks where !docks.contains(d) && d.width >= d.height {
+            let now = docks.first { $0.intersects(d) && abs($0.maxY - d.maxY) < 1.5 }
+            func gone(_ x: CGFloat) -> Bool { now.map { x < $0.minX || x > $0.maxX } ?? true }
             var sitting = false
             switch mode {
             case .staying, .napping, .dazed, .petted: sitting = !inBox && catWindow == nil
             default: break
             }
             let feet = cat.position.y - catShape.halfH + catShape.foot
-            if sitting, abs(feet - d.maxY) < 1.5, cat.position.x >= d.minX, cat.position.x <= d.maxX {
+            if sitting, abs(feet - d.maxY) < 1.5, cat.position.x >= d.minX, cat.position.x <= d.maxX,
+               gone(cat.position.x) {
                 stayWindow = nil
                 startFalling(velocity: .zero)
             }
             for i in 0..<2 {
                 var p = i == 0 ? bone : box
                 let bottom = p.body.pos.y - p.shape.halfH + p.shape.foot
-                if p.isResting, p.restingWindow == nil, abs(bottom - d.maxY) < 1.5 {
+                if p.isResting, p.restingWindow == nil, abs(bottom - d.maxY) < 1.5,
+                   p.body.pos.x >= d.minX, p.body.pos.x <= d.maxX, gone(p.body.pos.x) {
                     p.state = .flying
                     p.body.vel = .zero
                     if i == 0 { bone = p } else { box = p }
@@ -1329,7 +1346,7 @@ struct Playground {
             guard let d = s.dock else { continue }
             let left = d.minX <= s.frame.minX + 1 && d.height > d.width
             let right = d.maxX >= s.frame.maxX - 1 && d.height > d.width
-            let wasThere = lastDocks.contains(d)
+            let wasThere = lastDocks.contains { $0.intersects(d) }
 
             func feetIn(_ p: CGPoint, _ shape: Shape, margin: CGFloat = 0.01) -> Bool {
                 d.contains(CGPoint(x: p.x, y: p.y - shape.halfH + shape.foot + margin))
