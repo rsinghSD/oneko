@@ -98,6 +98,11 @@ final class WelcomeWindow: NSPanel {
 final class WhatsNewWindow: NSPanel {
     /// The newest release first. Add an entry for every release.
     static let releases: [(version: String, items: [(symbol: String, title: String, text: String)])] = [
+        ("0.6.8", [
+            ("paintpalette", "Coat patterns, redone", "Tabby, Spotted, Calico, Bicolour, Tortoiseshell, Tuxedo, Socks, Colourpoint and Galaxy. Markings now follow each cat's body, so stripes stay on its back and spots stay put while it runs."),
+            ("square.and.arrow.down", "Save your coats", "Name a coat in Paint Your Coat and press Save. It joins the Coat menu, the other cats wear it when they take turns, and you can give it to any cat under Settings › Cats › Coats. Pick it in the painter again to change it or delete it."),
+            ("wand.and.stars", "A better painter", "An animated preview, Suggest Colours for every pattern, a second accent for Calico and Galaxy, soft shading, and an Auto outline that stays visible on dark coats."),
+        ]),
         ("0.6.5", [
             ("figure.climbing", "Off exploring", "Leave the mouse alone and a cat may climb up a window and stroll along its title bar, walk round the inside of a window's border, or run along the menu bar, scratching window edges on the way. Move the mouse and it comes running."),
             ("moon.zzz", "Less sleepy", "Cats nap less by default. Put one on a window, the Dock or the menu bar, or drop it inside a window, and it runs up and down there instead of dozing off. Pick how sleepy they are under Sleepiness in the menu bar menu."),

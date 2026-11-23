@@ -1359,9 +1359,21 @@ extension SelfTest {
         let tabby = sheet.recolored(Skin(id: Skin.paintedID, title: "", outline: RGBA(r: 0, g: 0, b: 0),
                                          fill: RGBA(r: 245, g: 161, b: 66), accent: accent, pattern: .tabby))
         check(tabby !== sheet, "a painted coat makes a new sheet")
-        check(CoatPattern.tabby.accent(x: 0, y: 5) && !CoatPattern.tabby.accent(x: 3, y: 5)
-              && CoatPattern.socks.accent(x: 10, y: 28) && !CoatPattern.solid.accent(x: 10, y: 28),
-              "coat patterns put the accent where they should")
+        // Every pattern but Solid marks part of the sitting cat, and never the outline or the "Z z".
+        let idle = SpriteName.idle.cell(at: 0)
+        func accentPixels(_ p: CoatPattern) -> Int {
+            let s = sheet.recolored(Skin(id: "t", title: "", outline: RGBA(r: 0, g: 0, b: 0), fill: RGBA(r: 245, g: 161, b: 66),
+                                         accent: RGBA(r: 0, g: 0, b: 255), pattern: p, accent2: RGBA(r: 0, g: 0, b: 255)))
+            var n = 0
+            for y in 0..<32 { for x in 0..<32 {
+                let i = ((idle.row * 32 + y) * 256 + idle.col * 32 + x) * 4
+                if s.rgbaPixels[i + 2] == 255 && s.rgbaPixels[i] == 0 { n += 1 }
+            } }
+            return n
+        }
+        let counts = CoatPattern.allCases.map(accentPixels)
+        check(counts[0] == 0 && counts.dropFirst().allSatisfy { $0 > 0 },
+              "every coat pattern marks the cat (\(counts.map(String.init).joined(separator: " ")))")
         check(RGBA(hex: "F5A142") == RGBA(r: 245, g: 161, b: 66) && RGBA(r: 1, g: 2, b: 3).hex == "010203",
               "coat colours save and load as hex")
 

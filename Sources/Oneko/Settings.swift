@@ -364,21 +364,59 @@ final class Settings {
     /// Flicking the cat up off the Touch Bar sends it to the desktop.
     var flickToDesktop: Bool { get { bool(Key.flickToDesktop) } set { set(newValue, Key.flickToDesktop) } }
 
-    /// The coat from the coat painter.
+    /// The coat from the coat painter ("My Coat").
     var paintedSkin: Skin {
         get {
-            Skin(id: Skin.paintedID, title: "My Coat",
-                 outline: RGBA(hex: defaults.string(forKey: Key.paintOutline) ?? "000000"),
-                 fill: RGBA(hex: defaults.string(forKey: Key.paintFill) ?? "F5A142"),
-                 accent: RGBA(hex: defaults.string(forKey: Key.paintAccent) ?? "FFFFFF"),
-                 pattern: CoatPattern(rawValue: defaults.string(forKey: Key.paintPattern) ?? "") ?? .solid)
+            Self.decodeCoat([
+                "outline": defaults.string(forKey: Key.paintOutline) ?? "000000",
+                "fill": defaults.string(forKey: Key.paintFill) ?? "F5A142",
+                "accent": defaults.string(forKey: Key.paintAccent) ?? "FFFFFF",
+                "accent2": defaults.string(forKey: Key.paintAccent2) ?? "",
+                "pattern": defaults.string(forKey: Key.paintPattern) ?? "",
+                "shade": defaults.bool(forKey: Key.paintShade) ? "1" : "",
+                "auto": defaults.bool(forKey: Key.paintAuto) ? "1" : "",
+            ], id: Skin.paintedID, title: "My Coat")
         }
         set {
             defaults.set(newValue.outline.hex, forKey: Key.paintOutline)
             defaults.set(newValue.fill.hex, forKey: Key.paintFill)
             defaults.set((newValue.accent ?? newValue.fill).hex, forKey: Key.paintAccent)
+            defaults.set(newValue.accent2?.hex ?? "", forKey: Key.paintAccent2)
             defaults.set(newValue.pattern.rawValue, forKey: Key.paintPattern)
+            defaults.set(newValue.shade, forKey: Key.paintShade)
+            defaults.set(newValue.autoOutline, forKey: Key.paintAuto)
         }
+    }
+
+    /// Coats saved from the painter with a name. Every cat can wear them.
+    var savedCoats: [Skin] {
+        get {
+            (defaults.array(forKey: Key.savedCoats) as? [[String: String]] ?? []).compactMap { d in
+                guard let id = d["id"], id.hasPrefix(Skin.savedPrefix) else { return nil }
+                return Self.decodeCoat(d, id: id, title: d["title"] ?? "Coat")
+            }
+        }
+        set { defaults.set(newValue.map(Self.encodeCoat), forKey: Key.savedCoats) }
+    }
+
+    /// Any coat by id: built in, My Coat or saved. nil for the custom sheet and unknown ids.
+    func coat(id: String) -> Skin? {
+        if id == Skin.paintedID { return paintedSkin }
+        if id.hasPrefix(Skin.savedPrefix) { return savedCoats.first { $0.id == id } }
+        return Skin.all.first { $0.id == id }
+    }
+
+    private static func encodeCoat(_ s: Skin) -> [String: String] {
+        ["id": s.id, "title": s.title, "outline": s.outline.hex, "fill": s.fill.hex, "accent": (s.accent ?? s.fill).hex,
+         "accent2": s.accent2?.hex ?? "", "pattern": s.pattern.rawValue, "shade": s.shade ? "1" : "",
+         "auto": s.autoOutline ? "1" : ""]
+    }
+
+    private static func decodeCoat(_ d: [String: String], id: String, title: String) -> Skin {
+        let a2 = d["accent2"] ?? ""
+        return Skin(id: id, title: title, outline: RGBA(hex: d["outline"] ?? "000000"), fill: RGBA(hex: d["fill"] ?? "FFFFFF"),
+                    accent: RGBA(hex: d["accent"] ?? "000000"), pattern: CoatPattern(rawValue: d["pattern"] ?? "") ?? .solid,
+                    accent2: a2.isEmpty ? nil : RGBA(hex: a2), shade: d["shade"] == "1", autoOutline: d["auto"] == "1")
     }
 
     var skin: String {
@@ -438,7 +476,8 @@ final class Settings {
         static let sound = "sound", volume = "volume", catCount = "catCount", hat = "hat", reacts = "reacts"
         static let yarnOut = "yarnOut", slamToTouchBar = "slamToTouchBar", flickToDesktop = "flickToDesktop"
         static let paintOutline = "paintOutline", paintFill = "paintFill", paintAccent = "paintAccent"
-        static let paintPattern = "paintPattern"
+        static let paintPattern = "paintPattern", paintAccent2 = "paintAccent2", paintShade = "paintShade"
+        static let paintAuto = "paintAuto", savedCoats = "savedCoats"
         static let crowdMode = "crowdMode", catBehavior = "catBehavior", coatMode = "coatMode"
         static let customCoats = "customCoats", seenWelcome = "seenWelcome"
         static let boxCount = "boxCount", lastBoxCount = "lastBoxCount", boxPositions = "boxPositions"

@@ -17,7 +17,13 @@ brew tap rsinghSD/oneko https://github.com/rsinghSD/oneko
 brew install --cask oneko
 ```
 
-Oneko runs on macOS 13 or later, on Apple silicon and Intel. It isn't notarized by Apple yet, so the first time, right-click **Oneko** in Applications and choose **Open**. Or run `xattr -dr com.apple.quarantine /Applications/Oneko.app`.
+Oneko runs on macOS 13 or later, on Apple silicon and Intel. It isn't notarized by Apple yet, so macOS blocks it the first time you open it:
+
+- **macOS 15 or later:** open Oneko, then click **Done** on the warning. Go to **System Settings → Privacy & Security**, scroll down, click **Open Anyway** next to Oneko, and confirm with your password or Touch ID.
+- **macOS 13 or 14:** right-click **Oneko** in Applications and choose **Open**.
+- **Any version:** run `xattr -dr com.apple.quarantine /Applications/Oneko.app` in Terminal.
+
+You'll need to do this again after each update.
 
 ## Build from source
 
@@ -64,7 +70,7 @@ New here? **How to Play…** in the menu (shown once on first launch) sums it al
 - **Toys ▸ Ball of Yarn:** it rolls with real physics, and the cat bats it and chases it while it rolls. Throw it, or click it for a nudge.
 - **Toys ▸ Laser Pointer:** a red dot follows your cursor, and the cat dashes after it and pounces.
 - **Toys ▸ Give Catnip:** about 12 seconds of zoomies.
-- **Coat ▸ Paint Your Coat…:** choose outline, fill and accent colours and a pattern (Tabby, Spots, Patches, Tuxedo, Socks) with a live preview. It's saved as **My Coat**.
+- **Coat ▸ Paint Your Coat…:** choose outline, fill and accent colours and a pattern (Tabby, Spotted, Calico, Bicolour, Tortoiseshell, Tuxedo, Socks, Colourpoint, Galaxy) with an animated preview. Markings follow the cat's body, so they stay put while it runs. **Use This Coat** puts it on as **My Coat**; give it a name and **Save** to keep as many coats as you like. Saved coats show up in every coat menu, so each cat can wear a different one.
 - **Hat:** **Seasonal** gives a witch hat from 15 to 31 October, a Santa hat in December and a party hat around New Year. Or pick one yourself, or none. Hats tilt and spin with the cat.
 - **Sounds** (off by default; turn them on under **Sounds ▸ Sounds On**, there's nothing to download): synthesised in code, with no audio files. A soft purr when you pet it, a mrrp on big yeets and box hops, a meow on waking, a thud on hard landings, and a sleepy yawn and sigh when it dozes off. There are three volume levels.
 - **Reacts to Your Mac:** after 2 minutes without input, everyone naps where they are. When you're back, they stretch awake. From 11 pm to 6 am it's a bit slower and naps more.
@@ -150,6 +156,7 @@ Settings, the cat's position and the toys' positions are saved between launches.
 | `Sources/Oneko/Toolbar.swift` | The HUD toolbox panel |
 | `Sources/Oneko/Sounds.swift` | Synthesised purr, meow, mrrp and thud; lifetime stats |
 | `Sources/Oneko/CoatPainter.swift` | The Paint Your Coat window |
+| `Sources/Oneko/CoatPattern.swift` | Coat patterns: works out each frame's body so markings follow the cat |
 
 ## License
 

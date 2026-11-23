@@ -120,10 +120,9 @@ if let i = CommandLine.arguments.firstIndex(of: "--export-art"), i + 1 < Command
     draw(PixelArt.yarn.image, 280, 44, 12, 12)
     draw(PixelArt.laserDot.image, 300, 48, 6, 6)
     // Row 2: every coat
-    let painted = [CoatPattern.tabby, .spots, .patches, .tuxedo, .socks].map {
-        Skin(id: Skin.paintedID, title: "", outline: RGBA(r: 40, g: 30, b: 20),
-             fill: $0 == .tuxedo ? RGBA(r: 30, g: 30, b: 36) : RGBA(r: 245, g: 161, b: 66),
-             accent: $0 == .tuxedo || $0 == .socks ? RGBA(r: 250, g: 250, b: 250) : RGBA(r: 150, g: 80, b: 30), pattern: $0)
+    let painted = [CoatPattern.tabby, .patches, .tortie, .point, .galaxy].map { p -> Skin in
+        let (o, f, a, a2) = p.suggested
+        return Skin(id: Skin.paintedID, title: "", outline: o, fill: f, accent: a, pattern: p, accent2: a2)
     }
     for (n, skin) in (Skin.all + painted).enumerated() {
         draw(sprites.recolored(skin).image(for: .idle, frame: 0), 2 + n * 27, 2, 32, 32)
@@ -182,6 +181,54 @@ if let i = CommandLine.arguments.firstIndex(of: "--export-about"), i + 1 < Comma
             }
         }
         print("about size:", v.bounds.size)
+    }
+    exit(0)
+}
+
+// Dev helper: `Oneko --export-coats dir` renders every coat pattern in a few poses
+// (coats.png) and the coat painter (painter.png, light mode).
+if let i = CommandLine.arguments.firstIndex(of: "--export-coats"), i + 1 < CommandLine.arguments.count {
+    _ = NSApplication.shared
+    let dir = CommandLine.arguments[i + 1]
+    let poses: [(SpriteName, Int)] = [(.idle, 0), (.E, 0), (.E, 1), (.S, 0), (.N, 0), (.sleeping, 0), (.alert, 0), (.scratchSelf, 0)]
+    let z = 4, rows = CoatPattern.allCases
+    let ctx = CGContext(data: nil, width: poses.count * 34 * z, height: rows.count * 34 * z, bitsPerComponent: 8, bytesPerRow: 0,
+                        space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+    ctx.interpolationQuality = .none
+    ctx.setFillColor(CGColor(red: 0.16, green: 0.16, blue: 0.18, alpha: 1))
+    ctx.fill(CGRect(x: 0, y: 0, width: ctx.width, height: ctx.height))
+    for (r, p) in rows.enumerated() {
+        let (o, f, a, a2) = p.suggested
+        let sheet = sprites.recolored(Skin(id: Skin.paintedID, title: "", outline: o, fill: f, accent: a, pattern: p, accent2: a2,
+                                           shade: p == .tabby || p == .spots))
+        for (c, pose) in poses.enumerated() {
+            guard let img = sheet.image(for: pose.0, frame: pose.1) else { continue }
+            ctx.draw(img, in: CGRect(x: (c * 34 + 1) * z, y: ctx.height - (r + 1) * 34 * z + z, width: 32 * z, height: 32 * z))
+        }
+    }
+    let png = NSBitmapImageRep(cgImage: ctx.makeImage()!).representation(using: .png, properties: [:])
+    try? png?.write(to: URL(fileURLWithPath: dir + "/coats.png"))
+
+    NSApp.appearance = NSAppearance(named: .aqua)
+    let delegate = AppDelegate(sprites: sprites)
+    let (o, f, a, a2) = CoatPattern.patches.suggested
+    let start = Skin(id: Skin.paintedID, title: "My Coat", outline: o, fill: f, accent: a, pattern: .patches, accent2: a2)
+    let painter = CoatPainter(base: sprites, settings: delegate.settings, start: start)
+    if let v = painter.contentView {
+        v.layoutSubtreeIfNeeded()
+        if let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) {
+            v.cacheDisplay(in: v.bounds, to: rep)
+            let img = NSImage(size: v.bounds.size)
+            img.lockFocus()
+            NSColor(white: 0.93, alpha: 1).setFill()
+            NSRect(origin: .zero, size: v.bounds.size).fill()
+            rep.draw(in: NSRect(origin: .zero, size: v.bounds.size))
+            img.unlockFocus()
+            if let tiff = img.tiffRepresentation, let out = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) {
+                try? out.write(to: URL(fileURLWithPath: dir + "/painter.png"))
+            }
+        }
+        print("painter size:", v.bounds.size)
     }
     exit(0)
 }

@@ -1,25 +1,5 @@
 import AppKit
 
-/// Patterns for a painted coat, applied to the fill.
-enum CoatPattern: String, CaseIterable {
-    case solid, tabby, spots, patches, tuxedo, socks
-    var title: String { rawValue.capitalized }
-
-    /// Does this (cell-local, top-left origin) pixel get the accent colour?
-    func accent(x: Int, y: Int) -> Bool {
-        switch self {
-        case .solid: return false
-        case .tabby: return x % 5 < 2
-        case .spots:
-            let h = ((x / 4) &* 73856093) ^ ((y / 4) &* 19349663)
-            return abs(h) % 5 == 0 && (x % 4 != 3) && (y % 4 != 3)
-        case .patches: return sin(Double(x) * 0.45 + 1.3) * cos(Double(y) * 0.38) > 0.35
-        case .tuxedo: return y >= 22 || (y >= 16 && abs(x - 16) < 4)
-        case .socks: return y >= 26
-        }
-    }
-}
-
 /// Coat colours, made by recolouring the classic sheet's outline and fill.
 struct Skin {
     let id: String
@@ -28,10 +8,26 @@ struct Skin {
     let fill: RGBA
     var accent: RGBA? = nil
     var pattern: CoatPattern = .solid
+    /// Calico's second patch colour or Galaxy's bright stars (nil: the accent again).
+    var accent2: RGBA? = nil
+    /// A darker fill along the bottom and right of the outline.
+    var shade = false
+    /// The painter picked the outline to stand out against the fill.
+    var autoOutline = false
+
+    /// Changes whenever anything that affects the drawn coat does (saved coats get edited).
+    var cacheKey: String {
+        [id, outline.hex, String(outline.a), fill.hex, String(fill.a), accent?.hex ?? "-", accent2?.hex ?? "-",
+         pattern.rawValue, shade ? "s" : ""].joined(separator: "|")
+    }
+
+    /// Saved coats are "coat-…"; the painter's working coat is `paintedID`.
+    var isPainted: Bool { id == Skin.paintedID || id.hasPrefix(Skin.savedPrefix) }
 
     static let classicID = "classic"
     static let customID = "custom"
     static let paintedID = "painted"
+    static let savedPrefix = "coat-"
 
     static let all: [Skin] = [
         Skin(id: classicID, title: "Classic", outline: RGBA(r: 0, g: 0, b: 0), fill: RGBA(r: 255, g: 255, b: 255)),
@@ -61,7 +57,9 @@ struct Skin {
         let accent = color((hue + 0.08 + next() * 0.3).truncatingRemainder(dividingBy: 1), 0.3 + next() * 0.6, 0.3 + next() * 0.6)
         let outline = color(hue, 0.5, 0.12 + next() * 0.2)
         let pattern = CoatPattern.allCases[Int(next() * Double(CoatPattern.allCases.count)) % CoatPattern.allCases.count]
-        return Skin(id: "random-\(seed)", title: "Random", outline: outline, fill: fill, accent: accent, pattern: pattern)
+        let accent2 = color((hue + 0.5).truncatingRemainder(dividingBy: 1), 0.4, 0.25 + next() * 0.3)
+        return Skin(id: "random-\(seed)", title: "Random", outline: outline, fill: fill, accent: accent, pattern: pattern,
+                    accent2: next() < 0.5 ? accent2 : nil)
     }
 }
 
@@ -112,15 +110,31 @@ final class SpriteSheet {
         return nil
     }
 
-    /// Same sheet with the black outline and white fill swapped for a skin's colours.
+    /// Same sheet with the black outline and white fill swapped for a skin's colours, and the
+    /// skin's pattern painted onto each frame's body.
     func recolored(_ skin: Skin) -> SpriteSheet {
         guard skin.id != Skin.classicID else { return self }
+        let patterned = (skin.pattern != .solid && skin.accent != nil) || skin.shade
+        let bodies = patterned ? self.bodies : []
+        let n = Self.cellSize, cols = width / n
+        let shade = skin.fill.shaded
         var out = [UInt8](repeating: 0, count: pixels.count)
         for i in stride(from: 0, to: pixels.count, by: 4) where pixels[i + 3] > 127 {
-            let ink = Int(pixels[i]) + Int(pixels[i + 1]) + Int(pixels[i + 2]) < 384
-            let px = (i / 4) % width, py = (i / 4) / width
-            let c = ink ? skin.outline
-                : (skin.accent != nil && skin.pattern.accent(x: px % 32, y: py % 32) ? skin.accent! : skin.fill)
+            var c = skin.fill
+            if isInk(at: i) {
+                c = skin.outline
+            } else if patterned {
+                let px = (i / 4) % width, py = (i / 4) / width
+                let body = bodies[(py / n) * cols + px / n]
+                if body.isBody(px % n, py % n) {
+                    switch body.mark(skin.pattern, x: px % n, y: py % n, shade: skin.shade) {
+                    case .fill: break
+                    case .accent: c = skin.accent ?? skin.fill
+                    case .accent2: c = skin.accent2 ?? skin.accent ?? skin.fill
+                    case .shade: c = shade
+                    }
+                }
+            }
             let a = UInt16(c.a)
             out[i] = UInt8(UInt16(c.r) * a / 255)
             out[i + 1] = UInt8(UInt16(c.g) * a / 255)
@@ -130,6 +144,24 @@ final class SpriteSheet {
         let img = PixelArt.makeImage(out, width: width, height: pixels.count / 4 / width) ?? sheet
         return SpriteSheet(sheet: img, pixels: out, width: width)
     }
+
+    private func isInk(at i: Int) -> Bool { Int(pixels[i]) + Int(pixels[i + 1]) + Int(pixels[i + 2]) < 384 }
+
+    /// Every frame's body, row by row, worked out once per sheet (all coats share the classic one).
+    private lazy var bodies: [CoatBody] = {
+        let n = Self.cellSize, cols = width / n, rows = pixels.count / 4 / width / n
+        return (0..<(rows * cols)).map { cell in
+            let ox = (cell % cols) * n, oy = (cell / cols) * n
+            var kind = [CoatBody.Kind](repeating: .clear, count: n * n)
+            for y in 0..<n {
+                for x in 0..<n {
+                    let i = ((oy + y) * width + ox + x) * 4
+                    if pixels[i + 3] > 127 { kind[y * n + x] = isInk(at: i) ? .ink : .fill }
+                }
+            }
+            return CoatBody(kind: kind)
+        }
+    }()
 
     /// The whole sheet as premultiplied RGBA8, top row first (for the crowd's GPU texture).
     var rgbaPixels: [UInt8] { pixels }

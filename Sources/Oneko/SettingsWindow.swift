@@ -186,6 +186,7 @@ final class GeneralPage: SettingsPage {
     private lazy var speed = popup(Settings.Speed.allCases.map(\.title), #selector(speedChanged))
     private lazy var size = popup(Settings.Size.allCases.map(\.title), #selector(sizeChanged))
     private lazy var coat = popup([], #selector(coatChanged))
+    private var coatIDs: [String] = []
     private lazy var hat = popup(["Seasonal", "None", "Santa Hat", "Witch Hat", "Party Hat"], #selector(hatChanged))
     private lazy var paused = checkbox("Paused (curls up and sleeps)", #selector(pauseChanged))
     private lazy var weather = popup(["Your local weather (rain, thunder, sun, snow)", "Seasonal (snow in winter, leaves in autumn)",
@@ -210,7 +211,6 @@ final class GeneralPage: SettingsPage {
     required init?(coder: NSCoder) { fatalError() }
 
     override func build() {
-        coat.addItems(withTitles: Skin.all.map(\.title) + ["My Coat", "Custom Sprite Sheet…"])
         row("Speed", speed)
         row("Size", size)
         gap()
@@ -232,9 +232,15 @@ final class GeneralPage: SettingsPage {
         speed.selectItem(at: Settings.Speed.allCases.firstIndex(of: s.speed) ?? 1)
         size.selectItem(at: Settings.Size.allCases.firstIndex(of: s.size) ?? 0)
         size.isEnabled = app?.touchBar == nil
-        if let i = Skin.all.firstIndex(where: { $0.id == s.skin }) { coat.selectItem(at: i) }
-        else if s.skin == Skin.paintedID { coat.selectItem(at: Skin.all.count) }
-        else { coat.selectItem(at: Skin.all.count + 1) }
+        // Built-in coats, My Coat, saved coats, then the custom sheet.
+        let ids = Skin.all.map(\.id) + [Skin.paintedID] + s.savedCoats.map(\.id) + [Skin.customID]
+        let titles = Skin.all.map(\.title) + ["My Coat"] + s.savedCoats.map(\.title) + ["Custom Sprite Sheet…"]
+        if titles != coat.itemTitles || ids != coatIDs {
+            coat.removeAllItems()
+            for t in titles { coat.menu?.addItem(withTitle: t, action: nil, keyEquivalent: "") }   // names may repeat
+            coatIDs = ids
+        }
+        coat.selectItem(at: ids.firstIndex(of: s.skin) ?? ids.count - 1)
         hat.selectItem(at: Self.hatKeys.firstIndex(of: s.hat) ?? 0)
         weather.selectItem(at: Self.weatherKeys.firstIndex(of: s.weather) ?? 0)
         if name.currentEditor() == nil { name.stringValue = s.catNames["0"] ?? "" }
@@ -253,11 +259,9 @@ final class GeneralPage: SettingsPage {
         changed { app?.settings.size = Settings.Size.allCases[size.indexOfSelectedItem]; app?.applySettings() }
     }
     @objc private func coatChanged() {
-        let i = coat.indexOfSelectedItem
-        if i < Skin.all.count {
-            changed { app?.settings.skin = Skin.all[i].id; app?.reloadSprites() }
-        } else if i == Skin.all.count {
-            changed { app?.settings.skin = Skin.paintedID; app?.reloadSprites() }
+        let id = coatIDs[safe: coat.indexOfSelectedItem] ?? Skin.classicID
+        if id != Skin.customID {
+            changed { app?.settings.skin = id; app?.reloadSprites() }
         } else {
             app?.chooseCustomSheet()
             refresh()
@@ -442,12 +446,12 @@ final class CatsPage: SettingsPage {
 /// One coat per cat, for cats 2…50.
 final class CoatListPanel: NSPanel {
     private weak var app: AppDelegate?
-    private static var choices: [(id: String, title: String)] {
-        [("", "Take turns")] + Skin.all.map { ($0.id, $0.title) } + [(Skin.paintedID, "My Coat"), ("random", "Random")]
-    }
+    private let choices: [(id: String, title: String)]
 
     init(app: AppDelegate) {
         self.app = app
+        choices = [("", "Take turns")] + Skin.all.map { ($0.id, $0.title) } + [(Skin.paintedID, "My Coat")]
+            + app.settings.savedCoats.map { ($0.id, $0.title) } + [("random", "Random")]
         super.init(contentRect: NSRect(x: 0, y: 0, width: 320, height: 420), styleMask: [.titled], backing: .buffered, defer: false)
         let n = min(app.settings.realCatCount, 50)
         let saved = app.settings.customCoats
@@ -457,8 +461,8 @@ final class CoatListPanel: NSPanel {
         rows.spacing = 6
         for i in 0..<max(0, n - 1) {
             let p = NSPopUpButton()
-            p.addItems(withTitles: Self.choices.map(\.title))
-            p.selectItem(at: Self.choices.firstIndex { $0.id == (saved[safe: i] ?? "") } ?? 0)
+            for c in choices { p.menu?.addItem(withTitle: c.title, action: nil, keyEquivalent: "") }
+            p.selectItem(at: choices.firstIndex { $0.id == (saved[safe: i] ?? "") } ?? 0)
             p.tag = i
             p.target = self
             p.action = #selector(picked(_:))
@@ -494,7 +498,7 @@ final class CoatListPanel: NSPanel {
         guard let app else { return }
         var list = app.settings.customCoats
         while list.count <= sender.tag { list.append("") }
-        list[sender.tag] = Self.choices[sender.indexOfSelectedItem].id
+        list[sender.tag] = choices[sender.indexOfSelectedItem].id
         app.settings.customCoats = list
         app.reloadSprites()
     }

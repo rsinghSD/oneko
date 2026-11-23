@@ -716,9 +716,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
            let custom = SpriteSheet.load(url: URL(fileURLWithPath: path)) {
             return custom
         }
-        if settings.skin == Skin.paintedID { return classic.recolored(settings.paintedSkin) }
-        let skin = Skin.all.first { $0.id == settings.skin } ?? Skin.all[0]
-        return classic.recolored(skin)
+        return classic.recolored(settings.coat(id: settings.skin) ?? Skin.all[0])
     }
 
     func applySettings() {
@@ -1432,9 +1430,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .random: return sheet(Skin.random(seed: i % 64))
         case .custom:
             let id = settings.customCoats[safe: i] ?? ""
-            if id == Skin.paintedID { return sheet(settings.paintedSkin) }
             if id == "random" { return sheet(Skin.random(seed: i % 64)) }
-            if let skin = Skin.all.first(where: { $0.id == id }) { return sheet(skin) }
+            if let skin = settings.coat(id: id) { return sheet(skin) }
             return sheet(rotatingSkin(i))
         }
     }
@@ -1442,17 +1439,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var sheetCache: [String: SpriteSheet] = [:]
 
     private func sheet(_ skin: Skin) -> SpriteSheet {
-        let key = skin.id == Skin.paintedID ? "painted-\(skin.fill.hex)\(skin.outline.hex)\((skin.accent ?? skin.fill).hex)\(skin.pattern.rawValue)" : skin.id
+        let key = skin.cacheKey
         if let s = sheetCache[key] { return s }
         let s = classic.recolored(skin)
         sheetCache[key] = s
         return s
     }
 
-    /// Taking turns with the other coats.
+    /// Taking turns with the other coats, saved ones included.
     private func rotatingSkin(_ i: Int) -> Skin {
-        let others = Skin.all.filter { $0.id != settings.skin && $0.id != "ghost" }
+        let others = rotation
         return others[i % others.count]
+    }
+
+    private var rotation: [Skin] {
+        (Skin.all + settings.savedCoats).filter { $0.id != settings.skin && $0.id != "ghost" }
     }
 
     /// The coats the crowd wears, as whole sheets.
@@ -1461,7 +1462,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .same: return [sprites]
         case .random: return (0..<24).map { classic.recolored(Skin.random(seed: 1000 + $0)) }
         case .rotate, .custom:
-            return Skin.all.filter { $0.id != settings.skin && $0.id != "ghost" }.map { classic.recolored($0) }
+            return rotation.map(sheet)
         }
     }
 
@@ -1661,12 +1662,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - Coats and hats
 
     @objc func paintCoat() {
-        let painter = CoatPainter(base: classic, start: settings.paintedSkin)
+        coatPainter?.close()
+        let current = settings.coat(id: settings.skin)
+        let painter = CoatPainter(base: classic, settings: settings,
+                                  start: current?.isPainted == true ? current! : settings.paintedSkin)
         painter.onApply = { [weak self] skin in
             guard let self else { return }
-            settings.paintedSkin = skin
-            settings.skin = Skin.paintedID
+            if skin.id == Skin.paintedID { settings.paintedSkin = skin }
+            settings.skin = skin.id
+            sheetCache.removeAll()
             reloadSprites()
+            settingsWindow?.refresh()
+        }
+        painter.onCoatsChanged = { [weak self] in
+            self?.sheetCache.removeAll()
+            self?.reloadSprites()
+            self?.settingsWindow?.refresh()
         }
         coatPainter = painter
         painter.present()
@@ -1805,7 +1816,7 @@ extension AppDelegate: ToolboxHost {
     var catPlay: Playground { play }
 
     var catFillColor: RGBA {
-        paintedColor ?? (Skin.all.first { $0.id == settings.skin }?.fill ?? RGBA(r: 255, g: 255, b: 255))
+        paintedColor ?? (settings.coat(id: settings.skin)?.fill ?? RGBA(r: 255, g: 255, b: 255))
     }
 
     func paintCat(_ c: RGBA) {
