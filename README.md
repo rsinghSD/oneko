@@ -4,7 +4,13 @@
 
 ▶️ [Watch the demo with sound](docs/8mb.video-wi7-2DdRmmdF.mp4)
 
+
 The classic Neko desktop cat, as a native menu bar app. It chases your cursor across every display and Space. When it's left alone it scratches, yawns and falls asleep.
+
+## Screenshots/Media
+<img width="1652" height="504" alt="Neko bonk" src="https://github.com/user-attachments/assets/2a4af41b-e819-4fd7-b885-e7c05e02277c" />
+
+<img width="1680" height="1050" alt="Neko sitting on terminal" src="https://github.com/user-attachments/assets/677b84aa-c89f-4fc8-8a60-54caaedb0e12" />
 
 ## Install
 
