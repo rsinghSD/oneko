@@ -170,3 +170,5 @@ Developed with ♥ by Ramandeep Singh ([github.com/rsinghSD](https://github.com/
 
 
 Sprites are the classic Neko/oneko artwork (Kenji Gotoh's NekoDA, Tatsuya Kato's oneko). The sheet and the behaviour come from [oneko.js](https://github.com/adryd325/oneko.js) by adryd, MIT-licensed (see `Resources/oneko.js-LICENSE.txt`).
+
+any feedback or contributions are welcome :)
