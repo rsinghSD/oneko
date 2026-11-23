@@ -166,7 +166,11 @@ Settings, the cat's position and the toys' positions are saved between launches.
 
 ## License
 
-Oneko's code is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE.md). You're welcome to use, study, modify and share it for **noncommercial** purposes, as long as the copyright notice stays. Selling it, or using it commercially, isn't allowed without permission.
+Copyright (C) 2026 Ramandeep Singh.
+
+Oneko is free and open source software under the [GNU General Public License v3.0](LICENSE). You can use, study, change and share it. If you share it, changed or not, you have to do so under the same license and include the full source code, so every copy stays free and open for everyone.
+
+Oneko 0.6.8 and earlier were released under the PolyForm Noncommercial License 1.0.0; everything after that is GPLv3.
 
 The classic Neko/oneko sprite artwork and the oneko.js behaviour it's based on keep their own credits and MIT notice (`Resources/oneko.js-LICENSE.txt`).
 
